@@ -1,6 +1,10 @@
 'use strict';
 
-require('dotenv').config();
+// Load server/.env by absolute path, not dotenv's default (relative to
+// process.cwd()) — a process manager (PM2, systemd, Docker) can launch this
+// script from a different working directory than "server/", which would
+// silently skip a real, correctly-filled .env and misreport it as missing.
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
 const http = require('http');
 const express = require('express');
