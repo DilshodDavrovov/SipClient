@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -sSL -o jssip.min.js \"https://cdn.jsdelivr.net/npm/jssip@3.10.1/dist/jssip.min.js\" --max-time 20)",
+      "Bash(curl -sSL -I --max-time 15 \"https://cdn.jsdelivr.net/npm/jssip@3.10.1/dist/jssip.min.js\")",
+      "Bash(curl -sSL --max-time 15 \"https://registry.npmjs.org/jssip\")",
+      "Bash(curl -sSL -I --max-time 15 \"https://unpkg.com/jssip@3.10.1/dist/jssip.min.js\")",
+      "Bash(curl -sSL --max-time 15 \"https://registry.npmjs.org/jssip/3.13.8\")",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(list\\(d.get\\('dist',{}\\).items\\(\\)\\)\\); print\\(list\\(d.keys\\(\\)\\)\\)\")",
+      "Bash(curl -sSL --max-time 15 \"https://data.jsdelivr.com/v1/packages/npm/jssip@3.13.8\")",
+      "Bash(mkdir -p vendor js css)",
+      "Bash(curl -sSL --max-time 20 -o vendor/jssip-3.13.8.min.js \"https://cdn.jsdelivr.net/npm/jssip@3.13.8/lib/JsSIP.min.js\")"
+    ]
+  }
+}

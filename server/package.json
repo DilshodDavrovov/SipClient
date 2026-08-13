@@ -1,0 +1,16 @@
+{
+  "name": "sip-operator-ami-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Backend bridge: keeps Asterisk AMI credentials server-side, exposes a small HTTP/WebSocket API for the SIP Operator web client (click-to-call, call list, live call events).",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^8.17.1"
+  }
+}

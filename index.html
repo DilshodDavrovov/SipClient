@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SIP Оператор</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<!-- On-page debug log — stands in for browser devtools, which the embedded
+     WebKit host (1C's HTML field) doesn't expose. Catches JS errors/
+     rejections plus explicit trace points from the call flow, as plain
+     selectable text so it can be copied out and shared. -->
+<div id="debugPanel" class="debug-panel hidden">
+  <div class="debug-panel-header">
+    <span>Панель отладки</span>
+    <div>
+      <button id="debugClearBtn" class="btn-link">Очистить</button>
+      <button id="debugCloseBtn" class="icon-btn" title="Закрыть">×</button>
+    </div>
+  </div>
+  <textarea id="debugLog" class="debug-log" readonly></textarea>
+</div>
+
+<main class="layout">
+
+  <section class="panel history-panel">
+    <div class="history-header">
+      <div class="history-tabs">
+        <button class="history-tab active" id="tabHistoryBtn" data-tab="history">Мои звонки</button>
+        <button class="history-tab" id="tabCallbacksBtn" data-tab="callbacks">Перезвонить позже<span class="tab-badge hidden" id="callbackBadge">0</span></button>
+        <button class="history-tab" id="tabNotesBtn" data-tab="notes">Заметки<span class="tab-badge hidden" id="noteBadge">0</span></button>
+        <button class="history-tab" id="tabContactsBtn" data-tab="contacts">Контакты</button>
+      </div>
+      <button id="addContactBtn" class="btn-link hidden">+ Новый контакт</button>
+    </div>
+
+    <div class="history-search-row" id="historySearchRow">
+      <input type="text" id="historySearchInput" class="history-search" placeholder="Поиск по номеру или имени..." />
+    </div>
+
+    <div class="history-period-row hidden" id="historyPeriodRow">
+      <button class="btn-sm btn-secondary period-btn active" data-period="all">Всё время</button>
+      <button class="btn-sm btn-secondary period-btn" data-period="today">Сегодня</button>
+      <button class="btn-sm btn-secondary period-btn" data-period="week">Неделя</button>
+      <button class="btn-sm btn-secondary period-btn" data-period="month">Месяц</button>
+      <span class="history-period-custom">
+        <input type="date" id="historyDateFrom" title="С даты" />
+        <span>—</span>
+        <input type="date" id="historyDateTo" title="По дату" />
+      </span>
+    </div>
+
+    <div id="recordingPlayer" class="recording-player hidden">
+      <span class="recording-player-label" id="recordingPlayerLabel">Запись звонка</span>
+      <audio id="recordingAudio" controls></audio>
+      <button id="recordingPlayerClose" class="icon-btn" title="Закрыть">×</button>
+    </div>
+
+    <div id="historyView" class="history-table-wrap">
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th class="col-dir"></th>
+            <th>Номер / имя</th>
+            <th>Время</th>
+            <th>Длительность</th>
+            <th>Статус</th>
+            <th class="col-play"></th>
+          </tr>
+        </thead>
+        <tbody id="historyBody">
+          <tr class="empty-row"><td colspan="6">Звонков пока нет</td></tr>
+        </tbody>
+      </table>
+      <div class="history-loadmore-row hidden" id="historyLoadMoreRow">
+        <span id="historyResultsInfo" class="history-results-info"></span>
+        <button id="historyLoadMoreBtn" class="btn-link hidden">Показать ещё</button>
+      </div>
+    </div>
+
+    <div id="callbacksView" class="history-table-wrap hidden">
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Когда перезвонить</th>
+            <th>Номер / имя</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="callbacksBody">
+          <tr class="empty-row"><td colspan="3">Отложенных звонков нет</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div id="notesView" class="history-table-wrap hidden">
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Дата</th>
+            <th>Номер / имя</th>
+            <th>Заметка</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="notesBody">
+          <tr class="empty-row"><td colspan="4">Заметок пока нет</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div id="contactsView" class="history-table-wrap hidden">
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Компания</th>
+            <th>ФИО менеджера</th>
+            <th>Телефоны</th>
+            <th>Оператор</th>
+            <th>Посл. звонок</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="contactsBody">
+          <tr class="empty-row"><td colspan="6">Контактов пока нет</td></tr>
+        </tbody>
+      </table>
+      <div class="history-loadmore-row hidden" id="contactsLoadMoreRow">
+        <span id="contactsResultsInfo" class="history-results-info"></span>
+        <button id="contactsLoadMoreBtn" class="btn-link hidden">Показать ещё</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="side-column">
+    <section class="stats-bar">
+      <div class="stat-tile stat-good">
+        <span class="stat-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12l5 5L20 6"/></svg></span>
+        <div class="stat-body">
+          <div class="stat-value" id="statHandled">0</div>
+          <div class="stat-label">Обработанные</div>
+        </div>
+      </div>
+      <div class="stat-tile stat-critical">
+        <span class="stat-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span>
+        <div class="stat-body">
+          <div class="stat-value" id="statMissed">0</div>
+          <div class="stat-label">Пропущенные</div>
+        </div>
+      </div>
+      <div class="stat-tile stat-booking">
+        <span class="stat-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/></svg></span>
+        <div class="stat-body">
+          <div class="stat-value" id="statBookings">0</div>
+          <div class="stat-label">Брони</div>
+        </div>
+      </div>
+      <div class="stat-tile stat-neutral">
+        <span class="stat-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="12" x2="12" y2="7"/><line x1="12" y1="12" x2="16" y2="14"/></svg></span>
+        <div class="stat-body">
+          <div class="stat-value" id="statDuration">0:00</div>
+          <div class="stat-label">Длительность разговора</div>
+        </div>
+      </div>
+      <div class="stat-tile stat-neutral"> 
+        <div class="stats-bar-actions">
+          <span class="reg-status" id="regStatus">
+            <span class="dot" id="regDot"></span>
+            <span id="regText">Не настроено</span>
+          </span>
+          <button id="debugBtn" class="icon-btn subtle" title="Панель отладки">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="14" r="6"/><line x1="12" y1="8" x2="12" y2="4"/><line x1="9" y1="6" x2="7" y2="3"/><line x1="15" y1="6" x2="17" y2="3"/><line x1="6" y1="11" x2="2" y2="10"/><line x1="6" y1="14" x2="2" y2="14"/><line x1="6" y1="17" x2="3" y2="19"/><line x1="18" y1="11" x2="22" y2="10"/><line x1="18" y1="14" x2="22" y2="14"/><line x1="18" y1="17" x2="21" y2="19"/></svg>
+          </button>
+          <button id="settingsBtn" class="icon-btn subtle" title="Настройки аккаунта">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3.5"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/><line x1="4.9" y1="4.9" x2="7" y2="7"/><line x1="17" y1="17" x2="19.1" y2="19.1"/><line x1="4.9" y1="19.1" x2="7" y2="17"/><line x1="17" y1="7" x2="19.1" y2="4.9"/></svg>
+          </button>
+        </div>
+
+      </div>
+
+    </section>
+
+  <section class="panel dialer-panel">
+
+    <!-- Incoming call alert -->
+    <div id="incomingCall" class="incoming-call hidden">
+      <div class="incoming-info">
+        <div class="incoming-label">Входящий звонок</div>
+        <div class="incoming-number" id="incomingNumber">—</div>
+        <div class="incoming-name" id="incomingName"></div>
+        <div class="incoming-hint hidden" id="incomingHint">Ответьте на вашем SIP-телефоне — из браузера можно только отклонить.</div>
+      </div>
+      <div class="incoming-actions">
+        <button id="acceptBtn" class="btn btn-accept">Принять</button>
+        <button id="declineBtn" class="btn btn-decline">Отклонить</button>
+      </div>
+    </div>
+
+    <!-- Active call panel -->
+    <div id="activeCall" class="active-call hidden">
+      <div class="active-call-top">
+        <div>
+          <div class="active-call-number" id="activeNumber">—</div>
+          <div class="active-call-state" id="activeState">—</div>
+        </div>
+        <div class="active-call-timer" id="activeTimer">00:00</div>
+      </div>
+      <div class="active-call-controls">
+        <button id="muteBtn" class="btn btn-toggle" title="Микрофон"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="8" y1="21" x2="16" y2="21"/></svg> Микрофон</button>
+        <button id="holdBtn" class="btn btn-toggle" title="Удержание"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Удержание</button>
+        <button id="keypadToggleBtn" class="btn btn-toggle" title="Клавиатура набора"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><circle cx="7" cy="7" r="1.6"/><circle cx="12" cy="7" r="1.6"/><circle cx="17" cy="7" r="1.6"/><circle cx="7" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="17" cy="12" r="1.6"/><circle cx="7" cy="17" r="1.6"/><circle cx="12" cy="17" r="1.6"/><circle cx="17" cy="17" r="1.6"/></svg> Клавиатура</button>
+        <button id="transferBtn" class="btn btn-toggle" title="Перевести звонок на другой номер"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 15 20 15"/><polyline points="15 10 20 15 15 20"/></svg> Перевести</button>
+        <button id="conferenceBtn" class="btn btn-toggle" title="Добавить номер в разговор"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="9" r="4"/><path d="M2 20c0-4 3-6 7-6s7 2 7 6"/><line x1="19" y1="4" x2="19" y2="10"/><line x1="16" y1="7" x2="22" y2="7"/></svg> Конференция</button>
+        <button id="hangupBtn" class="btn btn-hangup" title="Завершить звонок">Завершить</button>
+      </div>
+
+      <div id="transferRow" class="inline-action-row hidden">
+        <input type="text" id="transferNumberInput" placeholder="Номер для перевода" inputmode="tel" />
+        <button id="transferConfirmBtn" class="btn btn-primary btn-sm">Перевести</button>
+        <button id="transferCancelBtn" class="btn-link">Отмена</button>
+      </div>
+
+      <div id="conferenceRow" class="inline-action-row hidden">
+        <input type="text" id="conferenceNumberInput" placeholder="Номер для добавления" inputmode="tel" />
+        <button id="conferenceConfirmBtn" class="btn btn-primary btn-sm">Добавить</button>
+        <button id="conferenceCancelBtn" class="btn-link">Отмена</button>
+      </div>
+    </div>
+
+    <!-- Dial input (idle only, hidden while a call is active/incoming) -->
+    <div id="dialForm" class="dial-form">
+      <input type="text" id="dialInput" placeholder="Номер или SIP URI" autocomplete="off" inputmode="tel" />
+    </div>
+
+    <!-- Keypad: shared between dialing (idle) and DTMF (during a call).
+         Visibility is controlled from app.js depending on call state. -->
+    <div class="keypad" id="keypad">
+      <button class="key" data-key="1">1</button>
+      <button class="key" data-key="2">2</button>
+      <button class="key" data-key="3">3</button>
+      <button class="key" data-key="4">4</button>
+      <button class="key" data-key="5">5</button>
+      <button class="key" data-key="6">6</button>
+      <button class="key" data-key="7">7</button>
+      <button class="key" data-key="8">8</button>
+      <button class="key" data-key="9">9</button>
+      <button class="key" data-key="*">*</button>
+      <button class="key" data-key="0">0</button>
+      <button class="key" data-key="#">#</button>
+    </div>
+
+    <!-- Dial actions (idle only) -->
+    <div id="dialActions" class="dial-actions">
+      <button id="clearInputBtn" class="btn btn-secondary">Очистить</button>
+      <button id="callBtn" class="btn btn-call" disabled>Позвонить</button>
+    </div>
+
+    <div class="hint" id="audioHint"></div>
+  </section>
+  </div>
+
+</main>
+
+<!-- Settings modal -->
+<div id="settingsModal" class="modal hidden">
+  <div class="modal-content">
+    <h2>Настройки аккаунта</h2>
+
+    <label>Режим работы
+      <select id="cfgMode">
+        <option value="ami">Через сервер (AMI) — звонок приходит на ваш SIP-телефон</option>
+        <option value="webrtc">WebRTC в браузере — напрямую по SIP/WebSocket</option>
+      </select>
+    </label>
+    <p class="modal-hint" id="modeHint"></p>
+
+    <fieldset id="amiFields" class="modal-fieldset">
+      <label>Адрес backend-сервера
+        <input id="cfgBackendUrl" type="text" placeholder="http://localhost:3001" />
+      </label>
+      <label>API-ключ
+        <span class="password-field">
+          <input id="cfgBackendToken" type="password" autocomplete="new-password" />
+          <button type="button" class="toggle-visibility-btn" data-target="cfgBackendToken" title="Показать/скрыть">Показать</button>
+        </span>
+      </label>
+      <label>Ваш добавочный номер (extension)
+        <input id="cfgOperatorExt" type="text" placeholder="101" />
+      </label>
+    </fieldset>
+
+    <fieldset id="webrtcFields" class="modal-fieldset">
+      <label>WebSocket сервер
+        <input id="cfgWsServer" type="text" placeholder="wss://sip.example.com:8089/ws" />
+      </label>
+
+      <label>SIP URI
+        <input id="cfgSipUri" type="text" placeholder="sip:1001@example.com" />
+      </label>
+
+      <label>Пароль
+        <span class="password-field">
+          <input id="cfgPassword" type="password" autocomplete="new-password" />
+          <button type="button" class="toggle-visibility-btn" data-target="cfgPassword" title="Показать/скрыть">Показать</button>
+        </span>
+      </label>
+
+      <label>Отображаемое имя
+        <input id="cfgDisplayName" type="text" placeholder="Оператор 1" />
+      </label>
+
+      <label>STUN/TURN серверы (через запятую)
+        <input id="cfgIceServers" type="text" placeholder="stun:stun.l.google.com:19302" />
+      </label>
+
+      <div class="modal-row">
+        <label class="half">TURN логин
+          <input id="cfgTurnUser" type="text" />
+        </label>
+        <label class="half">TURN пароль
+          <span class="password-field">
+            <input id="cfgTurnPass" type="password" />
+            <button type="button" class="toggle-visibility-btn" data-target="cfgTurnPass" title="Показать/скрыть">Показать</button>
+          </span>
+        </label>
+      </div>
+    </fieldset>
+
+    <label class="checkbox-label">
+      <input id="cfgAutoRegister" type="checkbox" />
+      Автоматически подключаться при загрузке страницы
+    </label>
+
+    <div class="modal-actions">
+      <button id="cfgDisconnectBtn" class="btn-link danger">Отключиться</button>
+      <div class="modal-actions-right">
+        <button id="cfgCancelBtn" class="btn btn-secondary">Отмена</button>
+        <button id="cfgSaveBtn" class="btn btn-primary">Сохранить и подключиться</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Non-blocking notification — deliberately not alert()/confirm(): some
+     embedded browser shells (e.g. 1C's HTML field) have no native dialog
+     host and just hang forever on those calls, freezing the whole page. -->
+<div id="toast" class="toast hidden">
+  <span id="toastMessage"></span>
+  <button id="toastClose" class="toast-close" title="Закрыть">×</button>
+</div>
+
+<!-- Post-call outcome picker: visual only for now — no CRM/booking backend
+     is wired up yet, this just records the choice locally and tags the row
+     in "Мои звонки". -->
+<div id="outcomeModal" class="modal hidden">
+  <div class="modal-content outcome-content">
+    <!-- Populated right when the call is answered — see promptCallOutcome()
+         in app.js, backed by GET /api/contacts/lookup. Hidden entirely if
+         there's neither a matching contact nor any earlier call to show. -->
+    <div id="outcomeContext" class="outcome-context hidden">
+      <div class="outcome-context-name" id="outcomeContextName"></div>
+      <div class="outcome-context-last" id="outcomeContextLast"></div>
+    </div>
+    <h2>Результат звонка</h2>
+    <p class="modal-hint" id="outcomeSubtitle">Разговор завершён</p>
+
+    <div class="outcome-grid">
+      <button class="outcome-btn outcome-booking" data-outcome="booking">
+        <span class="outcome-icon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/></svg></span>
+        <span class="outcome-label">Открыть бронирование</span>
+        <!-- The call's id, as one plain integer (no dot) — see the matching
+             reinsertUniqueidDot() on the server, which puts the dot back
+             before looking the call up. Filled in by promptCallOutcome()
+             in app.js; only shown when there's an id to show. -->
+        <span class="outcome-call-id hidden" id="outcomeBookingCallId"></span>
+      </button>
+      <button class="outcome-btn outcome-note" data-outcome="note">
+        <span class="outcome-icon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="1"/><line x1="7" y1="8" x2="17" y2="8"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="7" y1="16" x2="13" y2="16"/></svg></span>
+        <span class="outcome-label">Создать заметку</span>
+      </button>
+      <button class="outcome-btn outcome-declined" data-outcome="declined">
+        <span class="outcome-icon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg></span>
+        <span class="outcome-label">Отказ клиента</span>
+      </button>
+      <button class="outcome-btn outcome-callback" data-outcome="callback">
+        <span class="outcome-icon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg></span>
+        <span class="outcome-label">Перезвонить позже</span>
+      </button>
+      <!-- Only shown when this number doesn't match an existing contact —
+           see promptCallOutcome() in app.js. -->
+      <button class="outcome-btn outcome-contact outcome-btn-wide hidden" id="outcomeCreateContactBtn" data-outcome="contact">
+        <span class="outcome-icon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="4"/><path d="M2 21c0-4.5 3-7 7-7"/><line x1="17" y1="9" x2="17" y2="15"/><line x1="14" y1="12" x2="20" y2="12"/></svg></span>
+        <span class="outcome-label">Номер не найден — создать контакт</span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Callback time picker — opens after choosing "Перезвонить позже" in the
+     outcome modal above. Only ever reached from there (no other entry
+     point), so its "back" button always returns to that picker rather than
+     just closing outright — every answered call needs SOME outcome
+     registered (see promptCallOutcome() in app.js), so there's no plain
+     "cancel to nothing" here anymore. -->
+<div id="callbackTimeModal" class="modal hidden">
+  <div class="modal-content">
+    <h2>Когда перезвонить?</h2>
+    <p class="modal-hint" id="callbackTimeSubtitle"></p>
+
+    <div class="callback-time-grid">
+      <button class="btn btn-secondary callback-time-btn" data-minutes="5">Через 5 мин</button>
+      <button class="btn btn-secondary callback-time-btn" data-minutes="10">Через 10 мин</button>
+      <button class="btn btn-secondary callback-time-btn" data-minutes="15">Через 15 мин</button>
+      <button class="btn btn-secondary callback-time-btn" data-minutes="20">Через 20 мин</button>
+      <button class="btn btn-secondary callback-time-btn" data-minutes="30">Через 30 мин</button>
+    </div>
+
+    <label>Своё время
+      <input id="callbackCustomTime" type="datetime-local" />
+    </label>
+
+    <div class="modal-actions">
+      <button id="callbackTimeCancelBtn" class="btn-link">← Назад к действиям</button>
+      <div class="modal-actions-right">
+        <button id="callbackCustomTimeBtn" class="btn btn-primary">Запланировать</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Note text entry — opens after choosing "Создать заметку" in the outcome
+     modal above, and also reused for editing an existing note. -->
+<div id="noteTextModal" class="modal hidden">
+  <div class="modal-content">
+    <h2 id="noteTextTitle">Заметка</h2>
+    <p class="modal-hint" id="noteTextSubtitle"></p>
+
+    <label>Текст заметки
+      <textarea id="noteTextInput" rows="4" placeholder="Что нужно запомнить об этом звонке..."></textarea>
+    </label>
+
+    <div class="modal-actions">
+      <button id="noteTextCancelBtn" class="btn-link">Отмена</button>
+      <div class="modal-actions-right">
+        <button id="noteTextSaveBtn" class="btn btn-primary">Сохранить</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Contact card: editable client fields + that client's call history
+     (matched server-side by phone number, see server/src/db.js). Reused for
+     both "+ Новый контакт" (empty, no history section) and clicking an
+     existing row. -->
+<div id="contactModal" class="modal hidden">
+  <div class="modal-content contact-content">
+    <h2 id="contactModalTitle">Новый контакт</h2>
+
+    <div class="modal-row">
+      <label class="half">Телефон основной
+        <input id="contactPhonePrimary" type="text" inputmode="tel" placeholder="+998 90 123-45-67" />
+      </label>
+      <label class="half">Телефон резервный
+        <input id="contactPhoneBackup" type="text" inputmode="tel" />
+      </label>
+    </div>
+
+    <div class="contact-call-row">
+      <button type="button" id="contactCallPrimaryBtn" class="btn btn-call btn-sm">Позвонить: основной</button>
+      <button type="button" id="contactCallBackupBtn" class="btn btn-call btn-sm hidden">Позвонить: резервный</button>
+    </div>
+
+    <label>Название фирмы
+      <input id="contactCompanyName" type="text" />
+    </label>
+
+    <div class="modal-row">
+      <label class="half">Ф.И.О. менеджера
+        <input id="contactManagerName" type="text" />
+      </label>
+      <label class="half">Оператор
+        <input id="contactOperatorExt" type="text" placeholder="101" />
+      </label>
+    </div>
+
+    <label>Комментарий
+      <textarea id="contactComment" rows="3" placeholder="Заметки о клиенте..."></textarea>
+    </label>
+
+    <div id="contactHistorySection" class="contact-history-section hidden">
+      <div class="contact-history-header">
+        <span>История звонков</span>
+        <span id="contactLastCall" class="modal-hint"></span>
+      </div>
+      <div class="history-table-wrap contact-history-wrap">
+        <table class="history-table">
+          <thead>
+            <tr>
+              <th class="col-dir"></th>
+              <th>Время</th>
+              <th>Длительность</th>
+              <th>Статус</th>
+              <th class="col-play"></th>
+            </tr>
+          </thead>
+          <tbody id="contactHistoryBody">
+            <tr class="empty-row"><td colspan="5">Звонков пока нет</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button id="contactDeleteBtn" class="btn-link danger hidden">Удалить контакт</button>
+      <div class="modal-actions-right">
+        <button id="contactCancelBtn" class="btn btn-secondary">Отмена</button>
+        <button id="contactSaveBtn" class="btn btn-primary">Сохранить</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<audio id="remoteAudio" autoplay></audio>
+
+<script src="vendor/jssip.bundle.min.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
