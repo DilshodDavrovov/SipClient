@@ -585,8 +585,12 @@ class CallStore extends EventEmitter {
         // any) — upsertCallRecord already resolves this for storage, so
         // reusing its return value here is free. The frontend reads
         // record.contactId to decide whether to offer "Создать контакт" on
-        // the post-call outcome picker, right when the client answers.
+        // the post-call outcome picker, right when the client answers, and
+        // record.contactCode to hand the client's code to 1C with the
+        // incoming-call event (see notify1C in js/app.js).
         record.contactId = this.db.upsertCallRecord(record);
+        const contact = record.contactId ? this.db.getContact(record.contactId) : null;
+        record.contactCode = (contact && contact.code) || null;
       } catch (err) {
         console.error('[call-store] failed to persist call record:', err.message);
       }

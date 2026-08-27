@@ -9,6 +9,69 @@ const CONFIG_KEY = 'sipOperator.config.v1';
 const HISTORY_MAX = 200; // cap on the live in-memory amiHistory list, not persisted anywhere
 
 /* -------------------------------------------------------------------- */
+/* Compatibility with 1C's embedded WebKit (a Safari 10.0-class engine). */
+/* Like fetch (see amiFetch below), URLSearchParams simply doesn't exist */
+/* there — and it's load-bearing here: init()'s configFromUrlParams()    */
+/* and every history/contacts query builder call it. Without this shim,  */
+/* in that engine init() dies before ever connecting (so no live call    */
+/* events — including incoming-call popups — ever arrive), and every     */
+/* period-button click throws before reaching the server. Only the parts */
+/* this app actually uses: string/object init, get/has/set/toString.     */
+/* -------------------------------------------------------------------- */
+if (!window.URLSearchParams) {
+  window.URLSearchParams = function (init) {
+    this._pairs = [];
+    if (typeof init === 'string') {
+      const query = init.charAt(0) === '?' ? init.slice(1) : init;
+      const parts = query ? query.split('&') : [];
+      for (let i = 0; i < parts.length; i++) {
+        if (!parts[i]) continue;
+        const eq = parts[i].indexOf('=');
+        const rawKey = eq === -1 ? parts[i] : parts[i].slice(0, eq);
+        const rawVal = eq === -1 ? '' : parts[i].slice(eq + 1);
+        try {
+          this._pairs.push([
+            decodeURIComponent(rawKey.replace(/\+/g, ' ')),
+            decodeURIComponent(rawVal.replace(/\+/g, ' ')),
+          ]);
+        } catch (e) { /* skip a malformed percent-encoded pair */ }
+      }
+    } else if (init && typeof init === 'object') {
+      for (const key in init) {
+        if (Object.prototype.hasOwnProperty.call(init, key)) this._pairs.push([key, String(init[key])]);
+      }
+    }
+  };
+  window.URLSearchParams.prototype = {
+    get: function (name) {
+      for (let i = 0; i < this._pairs.length; i++) {
+        if (this._pairs[i][0] === name) return this._pairs[i][1];
+      }
+      return null;
+    },
+    has: function (name) { return this.get(name) !== null; },
+    set: function (name, value) {
+      for (let i = this._pairs.length - 1; i >= 0; i--) {
+        if (this._pairs[i][0] === name) this._pairs.splice(i, 1);
+      }
+      this._pairs.push([name, String(value)]);
+    },
+    append: function (name, value) { this._pairs.push([name, String(value)]); },
+    toString: function () {
+      return this._pairs
+        .map((pair) => encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1]))
+        .join('&');
+    },
+  };
+}
+
+// Present in Safari 10 (so current 1C builds have it), but the shim costs
+// one line if an even older engine ever shows up.
+if (window.NodeList && NodeList.prototype && !NodeList.prototype.forEach) {
+  NodeList.prototype.forEach = Array.prototype.forEach;
+}
+
+/* -------------------------------------------------------------------- */
 /* DOM references                                                        */
 /* -------------------------------------------------------------------- */
 const el = {
@@ -84,6 +147,7 @@ const el = {
   outcomeContextLast: document.getElementById('outcomeContextLast'),
   outcomeCreateContactBtn: document.getElementById('outcomeCreateContactBtn'),
   outcomeBookingCallId: document.getElementById('outcomeBookingCallId'),
+  outcomeBookingClientCode: document.getElementById('outcomeBookingClientCode'),
 
   callbackTimeModal: document.getElementById('callbackTimeModal'),
   callbackTimeSubtitle: document.getElementById('callbackTimeSubtitle'),
@@ -100,10 +164,10 @@ const el = {
 
   contactModal: document.getElementById('contactModal'),
   contactModalTitle: document.getElementById('contactModalTitle'),
-  contactPhonePrimary: document.getElementById('contactPhonePrimary'),
-  contactPhoneBackup: document.getElementById('contactPhoneBackup'),
-  contactCallPrimaryBtn: document.getElementById('contactCallPrimaryBtn'),
-  contactCallBackupBtn: document.getElementById('contactCallBackupBtn'),
+  contactCode: document.getElementById('contactCode'),
+  // Up to 4 interchangeable numbers per contact — index 0 is "Телефон 1".
+  contactPhoneInputs: [1, 2, 3, 4].map((i) => document.getElementById('contactPhone' + i)),
+  contactCallRow: document.getElementById('contactCallRow'),
   contactCompanyName: document.getElementById('contactCompanyName'),
   contactManagerName: document.getElementById('contactManagerName'),
   contactOperatorExt: document.getElementById('contactOperatorExt'),
@@ -126,6 +190,8 @@ const el = {
   conferenceNumberInput: document.getElementById('conferenceNumberInput'),
   conferenceConfirmBtn: document.getElementById('conferenceConfirmBtn'),
   conferenceCancelBtn: document.getElementById('conferenceCancelBtn'),
+
+  oneCEventBridge: document.getElementById('oneCEventBridge'),
 
   toast: document.getElementById('toast'),
   toastMessage: document.getElementById('toastMessage'),
@@ -525,6 +591,28 @@ function historyBackendReady() {
   return !!(amiRt.backendUp && cfg && cfg.backendUrl && cfg.backendToken && cfg.operatorExt);
 }
 
+// Tolerant of both the native date input's "2026-08-25" and hand-typed
+// "25.08.2026" / "25/08/2026" — in 1C's WebKit <input type="date"> silently
+// degrades to a plain text box (see the placeholder fallback below), so
+// whatever the operator types has to be parseable too. Builds the Date from
+// numeric parts instead of Date-string parsing, which old engines handle
+// inconsistently. Returns epoch ms, or undefined for anything unparseable.
+function parseDateInputValue(value, endOfDay) {
+  const parts = String(value || '').trim().split(/[.\-\/]/);
+  if (parts.length !== 3) return undefined;
+  let year, month, day;
+  if (parts[0].length === 4) { // "2026-08-25"
+    year = Number(parts[0]); month = Number(parts[1]); day = Number(parts[2]);
+  } else {                     // "25.08.2026"
+    day = Number(parts[0]); month = Number(parts[1]); year = Number(parts[2]);
+  }
+  if (year >= 0 && year < 100) year += 2000;
+  if (!year || !month || !day || month > 12 || day > 31) return undefined;
+  const d = endOfDay ? new Date(year, month - 1, day, 23, 59, 59) : new Date(year, month - 1, day);
+  const ts = d.getTime();
+  return isNaN(ts) ? undefined : ts;
+}
+
 function periodToRange(period) {
   const now = Date.now();
   if (period === 'today') {
@@ -535,8 +623,8 @@ function periodToRange(period) {
   if (period === 'month') return { from: now - 30 * 86400000, to: now };
   if (period === 'custom') {
     return {
-      from: el.historyDateFrom.value ? new Date(el.historyDateFrom.value + 'T00:00:00').getTime() : undefined,
-      to: el.historyDateTo.value ? new Date(el.historyDateTo.value + 'T23:59:59').getTime() : undefined,
+      from: parseDateInputValue(el.historyDateFrom.value, false),
+      to: parseDateInputValue(el.historyDateTo.value, true),
     };
   }
   return {}; // 'all' — no date bound at all, just the plain indexed query
@@ -593,25 +681,55 @@ const debouncedHistoryRefresh = debounce(() => { if (currentHistoryTab === 'hist
 
 el.historyLoadMoreBtn.addEventListener('click', () => loadHistoryPage(true));
 
-document.querySelectorAll('.period-btn').forEach((btn) => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.period-btn').forEach((b) => b.classList.remove('active'));
-    btn.classList.add('active');
-    historyPeriod = btn.dataset.period;
-    el.historyDateFrom.value = '';
-    el.historyDateTo.value = '';
-    loadHistoryPage(false);
-  });
+// The period picker must keep working even in the most bare-bones embedded
+// engine (1C's WebKit), so this path is deliberately lowest-common-
+// denominator: one delegated click listener instead of per-button ones
+// (nothing iterates a NodeList at load time), and a plain for-loop with
+// single-argument classList calls for the active highlight (no two-argument
+// classList.toggle). Every click also lands in the debug panel, so "ничего
+// не произошло" in 1C is diagnosable from the page itself.
+function updatePeriodButtonsUi() {
+  const buttons = document.querySelectorAll('.period-btn');
+  for (let i = 0; i < buttons.length; i++) {
+    if (buttons[i].getAttribute('data-period') === historyPeriod) buttons[i].classList.add('active');
+    else buttons[i].classList.remove('active');
+  }
+}
+
+el.historyPeriodRow.addEventListener('click', (e) => {
+  const btn = e.target.closest('.period-btn');
+  if (!btn) return;
+  historyPeriod = btn.getAttribute('data-period');
+  logDebug('history period -> ' + historyPeriod);
+  updatePeriodButtonsUi();
+  el.historyDateFrom.value = '';
+  el.historyDateTo.value = '';
+  loadHistoryPage(false);
 });
 
 function handleCustomHistoryDate() {
   if (!el.historyDateFrom.value && !el.historyDateTo.value) return;
   historyPeriod = 'custom';
-  document.querySelectorAll('.period-btn').forEach((b) => b.classList.remove('active'));
+  logDebug(`history period -> custom: "${el.historyDateFrom.value}" — "${el.historyDateTo.value}"`);
+  updatePeriodButtonsUi();
   loadHistoryPage(false);
 }
 el.historyDateFrom.addEventListener('change', handleCustomHistoryDate);
 el.historyDateTo.addEventListener('change', handleCustomHistoryDate);
+
+// In an engine without <input type="date"> (1C's WebKit) the fields degrade
+// to plain text boxes and the resolved `type` property stays "text" — give
+// them a format hint the tolerant parser above accepts, and apply what was
+// typed on Enter too ("change" alone only fires when the field loses focus).
+if (el.historyDateFrom.type !== 'date') {
+  el.historyDateFrom.placeholder = 'дд.мм.гггг';
+  el.historyDateTo.placeholder = 'дд.мм.гггг';
+  const applyOnEnter = (e) => {
+    if (e.key === 'Enter' || e.keyCode === 13) handleCustomHistoryDate();
+  };
+  el.historyDateFrom.addEventListener('keydown', applyOnEnter);
+  el.historyDateTo.addEventListener('keydown', applyOnEnter);
+}
 
 el.historySearchInput.addEventListener('input', () => {
   const q = el.historySearchInput.value;
@@ -626,7 +744,7 @@ el.historySearchInput.addEventListener('input', () => {
 
 function resetHistoryPeriodUi() {
   historyPeriod = 'all';
-  document.querySelectorAll('.period-btn').forEach((b) => b.classList.toggle('active', b.dataset.period === 'all'));
+  updatePeriodButtonsUi();
   el.historyDateFrom.value = '';
   el.historyDateTo.value = '';
 }
@@ -657,7 +775,7 @@ function switchHistoryTab(tab) {
   } else if (tab === 'notes') {
     refreshNotes();
   } else if (tab === 'contacts') {
-    el.historySearchInput.placeholder = 'Поиск по компании, ФИО, телефону...';
+    el.historySearchInput.placeholder = 'Поиск по коду, компании, ФИО, телефону...';
     contactsQuery = '';
     loadContacts(false);
   }
@@ -681,7 +799,7 @@ el.historyBody.addEventListener('click', (e) => {
   }
   const addBtn = e.target.closest('.add-contact-from-history-btn');
   if (addBtn) {
-    openContactCard(null, { phonePrimary: addBtn.dataset.number });
+    openContactCard(null, { phone: addBtn.dataset.number });
     return;
   }
   const noteBtn = e.target.closest('.note-from-history-btn');
@@ -758,6 +876,10 @@ function promptCallOutcome(entryLike) {
   // reinsertUniqueidDot() puts the "." back before looking the call up.
   el.outcomeBookingCallId.textContent = entryLike.id ? `ID: ${entryLike.id.replace(/\./g, '')}` : '';
   el.outcomeBookingCallId.classList.toggle('hidden', !entryLike.id);
+  // The client code arrives async with the contact lookup below — until (and
+  // unless) it does, the booking button shows only the call id.
+  el.outcomeBookingClientCode.textContent = '';
+  el.outcomeBookingClientCode.classList.add('hidden');
   el.outcomeModal.classList.remove('hidden');
   loadOutcomeContext(entryLike);
 }
@@ -787,6 +909,13 @@ function loadOutcomeContext(entryLike) {
       if (data.contact && data.contact.companyName) {
         el.outcomeContextName.textContent = data.contact.companyName;
         hasContent = true;
+      }
+      // The client code is the main identifier to carry into the external
+      // booking system — put it right on the booking button, next to the
+      // call id filled in by promptCallOutcome().
+      if (data.contact && data.contact.code) {
+        el.outcomeBookingClientCode.textContent = `Код: ${data.contact.code}`;
+        el.outcomeBookingClientCode.classList.remove('hidden');
       }
       if (data.lastCall) {
         const who = data.lastCall.operatorExtension
@@ -824,7 +953,7 @@ el.outcomeModal.addEventListener('click', (e) => {
     }
     if (outcome === 'contact') {
       openContactCard(null, {
-        phonePrimary: entry.number,
+        phone: entry.number,
         companyName: entry.name && entry.name !== entry.number ? entry.name : '',
         outcomeKey: key,
         backEntry: entry,
@@ -1220,7 +1349,7 @@ function contactsBackendReady() {
 function loadContacts(loadMore) {
   if (!contactsBackendReady()) {
     contactsRows = [];
-    el.contactsBody.innerHTML = '<tr class="empty-row"><td colspan="5">Контакты доступны только при подключении к серверу (режим AMI)</td></tr>';
+    el.contactsBody.innerHTML = '<tr class="empty-row"><td colspan="7">Контакты доступны только при подключении к серверу (режим AMI)</td></tr>';
     el.contactsLoadMoreRow.classList.add('hidden');
     return;
   }
@@ -1245,26 +1374,40 @@ function loadContacts(loadMore) {
     .catch((err) => showToast('Не удалось загрузить контакты: ' + err.message, { error: true }));
 }
 
+// Same calendar day as right now — not "the last 24 hours": a call at 23:50
+// yesterday should NOT light up green this morning.
+function isToday(ts) {
+  if (!ts) return false;
+  const d = new Date(ts);
+  const now = new Date();
+  return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+}
+
 function renderContactsTable() {
   if (!contactsRows.length) {
-    el.contactsBody.innerHTML = `<tr class="empty-row"><td colspan="6">${contactsQuery.trim() ? 'Ничего не найдено' : 'Контактов пока нет'}</td></tr>`;
+    el.contactsBody.innerHTML = `<tr class="empty-row"><td colspan="7">${contactsQuery.trim() ? 'Ничего не найдено' : 'Контактов пока нет'}</td></tr>`;
     return;
   }
-  el.contactsBody.innerHTML = contactsRows.map((c) => `
+  el.contactsBody.innerHTML = contactsRows.map((c) => {
+    const phones = (c.phones || []).filter(Boolean);
+    const calledToday = isToday(c.lastCallAt);
+    return `
     <tr class="contact-row" data-id="${escapeHtml(c.id)}">
+      <td class="contact-code">${escapeHtml(c.code || '—')}</td>
       <td>${escapeHtml(c.companyName || '—')}</td>
       <td>${escapeHtml(c.managerName || '—')}</td>
       <td class="contact-phones">
-        <span>${escapeHtml(c.phonePrimary || '—')}</span>
-        ${c.phoneBackup ? `<span class="contact-phone-secondary">${escapeHtml(c.phoneBackup)}</span>` : ''}
+        ${phones.length
+          ? phones.map((p, i) => `<span${i ? ' class="contact-phone-secondary"' : ''}>${escapeHtml(p)}</span>`).join('')
+          : '<span>—</span>'}
       </td>
       <td>${escapeHtml(c.operatorExtension || '—')}</td>
-      <td>${c.lastCallAt ? formatTimestamp(c.lastCallAt) : '—'}</td>
+      <td${calledToday ? ' class="last-call-today" title="Звонок был сегодня"' : ''}>${c.lastCallAt ? formatTimestamp(c.lastCallAt) : '—'}</td>
       <td class="col-contact-call">
-        ${c.phonePrimary ? `<button class="btn btn-call btn-sm contact-call-btn" data-number="${escapeHtml(c.phonePrimary)}" title="Позвонить">Позвонить</button>` : ''}
+        ${phones[0] ? `<button class="btn btn-call btn-sm contact-call-btn" data-number="${escapeHtml(phones[0])}" title="Позвонить">Позвонить</button>` : ''}
       </td>
-    </tr>
-  `).join('');
+    </tr>`;
+  }).join('');
 }
 
 el.contactsBody.addEventListener('click', (e) => {
@@ -1280,8 +1423,27 @@ el.contactsBody.addEventListener('click', (e) => {
 el.contactsLoadMoreBtn.addEventListener('click', () => loadContacts(true));
 el.addContactBtn.addEventListener('click', () => openContactCard(null));
 
-el.contactPhonePrimary.addEventListener('input', () => reformatPhoneInput(el.contactPhonePrimary));
-el.contactPhoneBackup.addEventListener('input', () => reformatPhoneInput(el.contactPhoneBackup));
+// One dial button per phone slot — a button is only shown while its input
+// actually holds something, tracked live as the operator types/clears.
+function updateContactCallButtons() {
+  el.contactCallRow.querySelectorAll('.contact-call-slot-btn').forEach((btn) => {
+    const input = el.contactPhoneInputs[Number(btn.dataset.phone) - 1];
+    btn.classList.toggle('hidden', !(input && input.value.trim()));
+  });
+}
+
+el.contactPhoneInputs.forEach((input) => input.addEventListener('input', () => {
+  reformatPhoneInput(input);
+  updateContactCallButtons();
+}));
+
+el.contactCallRow.addEventListener('click', (e) => {
+  const btn = e.target.closest('.contact-call-slot-btn');
+  if (!btn) return;
+  const input = el.contactPhoneInputs[Number(btn.dataset.phone) - 1];
+  closeContactModal();
+  dialNumber(input ? input.value : '');
+});
 
 function closeContactModal() {
   el.contactModal.classList.add('hidden');
@@ -1293,7 +1455,7 @@ function closeContactModal() {
 }
 
 // `prefill` (only meaningful when id is null, i.e. creating a new contact):
-// { phonePrimary, companyName, outcomeKey, backEntry } — used by the
+// { phone, companyName, outcomeKey, backEntry } — used by the
 // "unrecognized number" button on history rows, the post-call outcome
 // picker's "Создать контакт" option (also sets backEntry, for "Назад"), and
 // plain "+ Новый контакт" (neither set).
@@ -1315,10 +1477,12 @@ function openContactCard(id, prefill) {
 
   if (!id) {
     el.contactModalTitle.textContent = 'Новый контакт';
-    const phone = (prefill && prefill.phonePrimary) || '';
-    el.contactPhonePrimary.value = looksLikePlainNumber(phone) ? formatPhoneDisplay(phone) : phone;
-    el.contactPhoneBackup.value = '';
-    el.contactCallBackupBtn.classList.add('hidden');
+    el.contactCode.value = '';
+    const phone = (prefill && prefill.phone) || '';
+    el.contactPhoneInputs.forEach((input, i) => {
+      input.value = i === 0 && phone ? (looksLikePlainNumber(phone) ? formatPhoneDisplay(phone) : phone) : '';
+    });
+    updateContactCallButtons();
     el.contactCompanyName.value = (prefill && prefill.companyName) || '';
     el.contactManagerName.value = '';
     el.contactOperatorExt.value = (loadConfig() || {}).operatorExt || '';
@@ -1333,14 +1497,16 @@ function openContactCard(id, prefill) {
   amiFetch(cfg, `/api/contacts/${encodeURIComponent(id)}`)
     .then((data) => {
       const c = data.contact;
-      el.contactPhonePrimary.value = c.phonePrimary || '';
-      el.contactPhoneBackup.value = c.phoneBackup || '';
-      el.contactCallBackupBtn.classList.toggle('hidden', !c.phoneBackup);
+      el.contactCode.value = c.code || '';
+      el.contactPhoneInputs.forEach((input, i) => { input.value = (c.phones && c.phones[i]) || ''; });
+      updateContactCallButtons();
       el.contactCompanyName.value = c.companyName || '';
       el.contactManagerName.value = c.managerName || '';
       el.contactOperatorExt.value = c.operatorExtension || '';
       el.contactComment.value = c.comment || '';
       el.contactLastCall.textContent = c.lastCallAt ? `Последний звонок: ${formatTimestamp(c.lastCallAt)}` : 'Звонков ещё не было';
+      // Same "called today → green" cue as the contacts table's date column.
+      el.contactLastCall.classList.toggle('last-call-today', isToday(c.lastCallAt));
       renderContactHistory(data.calls || []);
     })
     .catch((err) => {
@@ -1348,15 +1514,6 @@ function openContactCard(id, prefill) {
       closeContactModal();
     });
 }
-
-el.contactCallPrimaryBtn.addEventListener('click', () => {
-  closeContactModal();
-  dialNumber(el.contactPhonePrimary.value);
-});
-el.contactCallBackupBtn.addEventListener('click', () => {
-  closeContactModal();
-  dialNumber(el.contactPhoneBackup.value);
-});
 
 function renderContactHistory(records) {
   if (!records.length) {
@@ -1403,9 +1560,9 @@ el.contactCancelBtn.addEventListener('click', () => {
 });
 
 el.contactSaveBtn.addEventListener('click', () => {
-  const phonePrimary = el.contactPhonePrimary.value.trim();
-  if (!phonePrimary) {
-    showToast('Укажите основной номер телефона', { error: true });
+  const phones = el.contactPhoneInputs.map((input) => input.value.trim());
+  if (!phones.some(Boolean)) {
+    showToast('Укажите хотя бы один номер телефона', { error: true });
     return;
   }
   if (!contactsBackendReady()) {
@@ -1415,8 +1572,8 @@ el.contactSaveBtn.addEventListener('click', () => {
 
   const cfg = loadConfig();
   const payload = {
-    phonePrimary,
-    phoneBackup: el.contactPhoneBackup.value.trim(),
+    code: el.contactCode.value.trim(),
+    phones,
     companyName: el.contactCompanyName.value.trim(),
     managerName: el.contactManagerName.value.trim(),
     operatorExtension: el.contactOperatorExt.value.trim(),
@@ -2077,7 +2234,38 @@ function applyAmiRecordToUi(record, cfg) {
   showActiveCallAmi(record, cfg);
 }
 
+/* -------------------------------------------------------------------- */
+/* JS -> 1C event bridge. 1C's HTML field can't subscribe to arbitrary   */
+/* JS events, but it does get its own ПриНажатии (OnClick) with the      */
+/* clicked element in ДанныеСобытия — so "sending an event to 1C" means  */
+/* stamping the details onto a hidden button (see index.html) and        */
+/* clicking it programmatically. Outside 1C the click just lands on a    */
+/* display:none button nobody listens to — a no-op.                      */
+/* -------------------------------------------------------------------- */
+let lastBridgeEventKey = null;
+
+function notify1C(eventName, record) {
+  // The same call can re-enter showIncomingCallAmi on every state update
+  // while it keeps ringing — 1C only needs to hear about it once.
+  const key = eventName + ':' + (record.id || '');
+  if (lastBridgeEventKey === key) return;
+  lastBridgeEventKey = key;
+
+  const bridge = el.oneCEventBridge;
+  bridge.setAttribute('data-event', eventName);
+  bridge.setAttribute('data-call-id', record.id || '');
+  bridge.setAttribute('data-number', (record.counterparty && record.counterparty.number) || '');
+  bridge.setAttribute('data-name', (record.counterparty && record.counterparty.name) || '');
+  // The client's code from the contact book (see _emitUpdate in
+  // call-store.js) — empty when this number isn't a known contact yet.
+  bridge.setAttribute('data-contact-code', record.contactCode || '');
+  bridge.setAttribute('data-contact-id', record.contactId || '');
+  try { bridge.click(); } catch (e) { /* ignore */ }
+  logDebug(`1C bridge: ${eventName} number=${(record.counterparty && record.counterparty.number) || ''}`);
+}
+
 function showIncomingCallAmi(record) {
+  notify1C('incoming', record);
   stopRingtone();
   el.incomingNumber.textContent = record.counterparty.number || '—';
   el.incomingName.textContent = record.counterparty.name || '';

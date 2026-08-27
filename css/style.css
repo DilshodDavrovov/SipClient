@@ -734,6 +734,9 @@ body {
 .contact-phones { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
 .contact-phone-secondary { color: var(--text-dim); }
 .col-contact-call { width: 1%; white-space: nowrap; }
+.contact-code { font-family: 'Courier New', monospace; font-weight: 600; white-space: nowrap; }
+/* "Посл. звонок" when that call happened today — a live client, worth noticing. */
+.last-call-today { color: var(--green); font-weight: 600; }
 
 .contact-content { width: 560px; }
 .contact-call-row { display: flex; gap: 8px; margin: -4px 0 14px; flex-wrap: wrap; }
@@ -799,6 +802,15 @@ body {
   font-weight: 400;
   font-family: 'Courier New', monospace;
   color: var(--text-dim);
+}
+
+/* The client's code on the booking button — the main id to carry over into
+   the booking system, so slightly louder than the call id above it. */
+.outcome-client-code {
+  font-size: 11px;
+  font-weight: 700;
+  font-family: 'Courier New', monospace;
+  color: var(--accent);
 }
 
 .outcome-booking { border-top-color: var(--accent); }

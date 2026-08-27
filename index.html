@@ -4,7 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>SIP Оператор</title>
-<link rel="stylesheet" href="css/style.css" />
+<!-- ?v= — против кэша встроенного WebKit 1С: при изменении css/js меняйте
+     номер версии здесь, иначе 1С может продолжать грузить старый файл. -->
+<link rel="stylesheet" href="css/style.css?v=20260825" />
 </head>
 <body>
 
@@ -115,6 +117,7 @@
       <table class="history-table">
         <thead>
           <tr>
+            <th>Код</th>
             <th>Компания</th>
             <th>ФИО менеджера</th>
             <th>Телефоны</th>
@@ -124,7 +127,7 @@
           </tr>
         </thead>
         <tbody id="contactsBody">
-          <tr class="empty-row"><td colspan="6">Контактов пока нет</td></tr>
+          <tr class="empty-row"><td colspan="7">Контактов пока нет</td></tr>
         </tbody>
       </table>
       <div class="history-loadmore-row hidden" id="contactsLoadMoreRow">
@@ -343,6 +346,17 @@
   </div>
 </div>
 
+<!-- JS -> 1C event bridge. The embedded HTML field's reliable JS-to-1C
+     channel is the field's own ПриНажатии (OnClick) event, so the page
+     "sends" an event by stamping its details onto this hidden button's
+     data-* attributes and clicking it programmatically (see notify1C() in
+     app.js). 1C side: handle the field's ПриНажатии, check
+     ДанныеСобытия.Element.id === "oneCEventBridge", read the attributes.
+     Invisible and inert in a normal browser. -->
+<button id="oneCEventBridge" type="button" style="display:none"
+        data-event="" data-call-id="" data-number="" data-name=""
+        data-contact-code="" data-contact-id=""></button>
+
 <!-- Non-blocking notification — deliberately not alert()/confirm(): some
      embedded browser shells (e.g. 1C's HTML field) have no native dialog
      host and just hang forever on those calls, freezing the whole page. -->
@@ -375,6 +389,10 @@
              before looking the call up. Filled in by promptCallOutcome()
              in app.js; only shown when there's an id to show. -->
         <span class="outcome-call-id hidden" id="outcomeBookingCallId"></span>
+        <!-- The client's code — the contact book's durable unique id, the
+             main thing to carry over into the booking system. Filled in
+             async by loadOutcomeContext() once the contact lookup returns. -->
+        <span class="outcome-client-code hidden" id="outcomeBookingClientCode"></span>
       </button>
       <button class="outcome-btn outcome-note" data-outcome="note">
         <span class="outcome-icon"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="1"/><line x1="7" y1="8" x2="17" y2="8"/><line x1="7" y1="12" x2="17" y2="12"/><line x1="7" y1="16" x2="13" y2="16"/></svg></span>
@@ -459,22 +477,41 @@
     <h2 id="contactModalTitle">Новый контакт</h2>
 
     <div class="modal-row">
-      <label class="half">Телефон основной
-        <input id="contactPhonePrimary" type="text" inputmode="tel" placeholder="+998 90 123-45-67" />
+      <label class="half">Код клиента
+        <input id="contactCode" type="text" placeholder="Уникальный код" />
       </label>
-      <label class="half">Телефон резервный
-        <input id="contactPhoneBackup" type="text" inputmode="tel" />
+      <label class="half">Название фирмы
+        <input id="contactCompanyName" type="text" />
       </label>
     </div>
 
-    <div class="contact-call-row">
-      <button type="button" id="contactCallPrimaryBtn" class="btn btn-call btn-sm">Позвонить: основной</button>
-      <button type="button" id="contactCallBackupBtn" class="btn btn-call btn-sm hidden">Позвонить: резервный</button>
+    <!-- Up to 4 interchangeable numbers per client — any of them resolves
+         calls to this contact (matched server-side, see db.js). -->
+    <div class="modal-row">
+      <label class="half">Телефон 1
+        <input id="contactPhone1" type="text" inputmode="tel" placeholder="+998 90 123-45-67" />
+      </label>
+      <label class="half">Телефон 2
+        <input id="contactPhone2" type="text" inputmode="tel" />
+      </label>
+    </div>
+    <div class="modal-row">
+      <label class="half">Телефон 3
+        <input id="contactPhone3" type="text" inputmode="tel" />
+      </label>
+      <label class="half">Телефон 4
+        <input id="contactPhone4" type="text" inputmode="tel" />
+      </label>
     </div>
 
-    <label>Название фирмы
-      <input id="contactCompanyName" type="text" />
-    </label>
+    <!-- One dial button per filled-in phone slot — visibility follows the
+         inputs above (see updateContactCallButtons() in app.js). -->
+    <div class="contact-call-row" id="contactCallRow">
+      <button type="button" class="btn btn-call btn-sm contact-call-slot-btn" data-phone="1">Позвонить: тел. 1</button>
+      <button type="button" class="btn btn-call btn-sm contact-call-slot-btn hidden" data-phone="2">Позвонить: тел. 2</button>
+      <button type="button" class="btn btn-call btn-sm contact-call-slot-btn hidden" data-phone="3">Позвонить: тел. 3</button>
+      <button type="button" class="btn btn-call btn-sm contact-call-slot-btn hidden" data-phone="4">Позвонить: тел. 4</button>
+    </div>
 
     <div class="modal-row">
       <label class="half">Ф.И.О. менеджера
@@ -525,6 +562,6 @@
 <audio id="remoteAudio" autoplay></audio>
 
 <script src="vendor/jssip.bundle.min.js"></script>
-<script src="js/app.js"></script>
+<script src="js/app.js?v=20260825"></script>
 </body>
 </html>

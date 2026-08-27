@@ -15,7 +15,6 @@ const AmiClient = require('./ami-client');
 const CallStore = require('./call-store');
 const CallFlowClient = require('./callflow-client');
 const { Db } = require('./db');
-const { startContactsSync } = require('./contacts-sync');
 
 const {
   AMI_HOST,
@@ -32,8 +31,6 @@ const {
   CALLFLOW_BASE_URL,
   CALLFLOW_USERNAME,
   CALLFLOW_PASSWORD,
-  CONTACTS_XML_URL,
-  CONTACTS_SYNC_INTERVAL_MS = String(10 * 60 * 1000),
 } = process.env;
 
 for (const [name, value] of Object.entries({ AMI_HOST, AMI_USERNAME, AMI_SECRET, API_TOKEN })) {
@@ -52,10 +49,9 @@ const db = new Db(dbFile);
 // database, then rename it out of the way so this doesn't re-run every boot.
 db.importJsonlIfPresent(path.join(__dirname, '..', 'data', 'calls.log.jsonl'));
 
-// Periodic client-list import (additive only — see contacts-sync.js for why
-// existing contacts are never overwritten). Runs once immediately, then on
-// CONTACTS_SYNC_INTERVAL_MS (default 10 minutes).
-startContactsSync(db, { url: CONTACTS_XML_URL, intervalMs: Number(CONTACTS_SYNC_INTERVAL_MS) });
+// The old periodic XML client-list sync (contacts-sync.js) is retired —
+// contacts now arrive from the external system via POST /api/contacts/upsert
+// (keyed by client code) instead of being polled from an XML feed.
 
 const callStore = new CallStore({ channelTech: AMI_CHANNEL_TECH, trackExtensions, db });
 
@@ -484,21 +480,90 @@ app.get('/api/contacts/:id', requireApiKey, (req, res) => {
   res.json({ contact, calls: calls.records, callsTotal: calls.total });
 });
 
-app.post('/api/contacts', requireApiKey, (req, res) => {
-  const { phonePrimary } = req.body || {};
-  if (!phonePrimary || !String(phonePrimary).trim()) {
-    return res.status(400).json({ error: '"phonePrimary" is required' });
+// Up to 4 interchangeable phones per contact (phones: ["...", ...]); at
+// least one non-empty is required from the UI paths here. Flat phone1..4
+// and the legacy phonePrimary/phoneBackup keys are accepted too (see
+// contactPhonesFromData in db.js).
+function contactBodyHasPhone(body) {
+  const phones = Array.isArray(body.phones)
+    ? body.phones
+    : [body.phone1, body.phone2, body.phone3, body.phone4, body.phonePrimary, body.phoneBackup];
+  return phones.some((p) => p && String(p).trim());
+}
+
+// The client code is unique (see idx_contacts_code_unique in db.js) — a
+// save that reuses another contact's code violates that index; turn the
+// raw SQLite error into a response the UI can show as-is.
+function handleContactSaveError(res, err) {
+  if (String(err.message).includes('contacts.code')) {
+    return res.status(409).json({ error: 'контакт с таким кодом уже существует' });
   }
-  res.status(201).json(db.createContact(req.body));
+  throw err;
+}
+
+app.post('/api/contacts', requireApiKey, (req, res) => {
+  if (!contactBodyHasPhone(req.body || {})) {
+    return res.status(400).json({ error: 'at least one phone number is required' });
+  }
+  try {
+    res.status(201).json(db.createContact(req.body));
+  } catch (err) {
+    handleContactSaveError(res, err);
+  }
 });
 
 app.put('/api/contacts/:id', requireApiKey, (req, res) => {
   if (!db.getContact(req.params.id)) return res.status(404).json({ error: 'contact not found' });
-  const { phonePrimary } = req.body || {};
-  if (!phonePrimary || !String(phonePrimary).trim()) {
-    return res.status(400).json({ error: '"phonePrimary" is required' });
+  if (!contactBodyHasPhone(req.body || {})) {
+    return res.status(400).json({ error: 'at least one phone number is required' });
   }
-  res.json(db.updateContact(req.params.id, req.body));
+  try {
+    res.json(db.updateContact(req.params.id, req.body));
+  } catch (err) {
+    handleContactSaveError(res, err);
+  }
+});
+
+// Import/refresh of the client book from the external booking system, keyed
+// by the client code (the contact's durable unique identifier). Accepts one
+// contact object, a bare array, or { contacts: [...] }; each item's fields:
+// code (required), phones (array of up to 4, or flat phone1..phone4 keys),
+// companyName, managerName, operatorExtension, comment. Re-sending an
+// existing code updates that contact in place (only the fields present in
+// the item — see upsertContactByCode in db.js); an unknown code creates a
+// new contact, EXCEPT when one of its numbers matches a pre-existing
+// contact that has no code yet — then the code is attached to that contact
+// instead of duplicating it. Same X-Api-Key auth as everything else; see
+// the "Интеграция с 1С" section in the project README for examples.
+app.post('/api/contacts/upsert', requireApiKey, (req, res) => {
+  const body = req.body || {};
+  const items = Array.isArray(body) ? body : (Array.isArray(body.contacts) ? body.contacts : [body]);
+  if (!items.length) return res.status(400).json({ error: 'no contacts in request body' });
+
+  let created = 0;
+  let updated = 0;
+  const results = items.map((item, index) => {
+    const code = item && String(item.code || '').trim();
+    if (!code) return { index, error: '"code" is required' };
+    try {
+      const r = db.upsertContactByCode(item);
+      if (r.created) created++; else updated++;
+      // `adopted: true` marks a pre-existing code-less contact that matched
+      // by phone number and had this code attached to it (counted as updated).
+      return { index, code, id: r.contact.id, created: r.created, adopted: r.adopted };
+    } catch (err) {
+      return { index, code, error: err.message };
+    }
+  });
+  const errors = results.filter((r) => r.error).length;
+  console.log(`[contacts-upsert] processed ${items.length} item(s): ${created} created, ${updated} updated, ${errors} error(s)`);
+  res.status(errors === items.length ? 400 : 200).json({ ok: errors === 0, created, updated, errors, results });
+});
+
+app.get('/api/contacts/by-code/:code', requireApiKey, (req, res) => {
+  const contact = db.getContactByCode(req.params.code);
+  if (!contact) return res.status(404).json({ error: 'contact not found' });
+  res.json(contact);
 });
 
 app.delete('/api/contacts/:id', requireApiKey, (req, res) => {

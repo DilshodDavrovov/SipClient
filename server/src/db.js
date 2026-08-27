@@ -26,10 +26,15 @@ const { DatabaseSync } = require('node:sqlite');
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS contacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  phone_primary TEXT,
-  phone_primary_norm TEXT,
-  phone_backup TEXT,
-  phone_backup_norm TEXT,
+  code TEXT,
+  phone1 TEXT,
+  phone1_norm TEXT,
+  phone2 TEXT,
+  phone2_norm TEXT,
+  phone3 TEXT,
+  phone3_norm TEXT,
+  phone4 TEXT,
+  phone4_norm TEXT,
   company_name TEXT,
   manager_name TEXT,
   operator_extension TEXT,
@@ -38,8 +43,6 @@ CREATE TABLE IF NOT EXISTS contacts (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_contacts_phone_primary_norm ON contacts(phone_primary_norm);
-CREATE INDEX IF NOT EXISTS idx_contacts_phone_backup_norm ON contacts(phone_backup_norm);
 
 CREATE TABLE IF NOT EXISTS calls (
   id TEXT PRIMARY KEY,
@@ -121,10 +124,49 @@ function normalizePhone(raw) {
   return digits.length > 9 ? digits.slice(-9) : digits;
 }
 
+// A contact holds up to 4 interchangeable phone numbers (phone1..phone4).
+const CONTACT_PHONE_SLOTS = 4;
+
+// Accepts any of the shapes a caller might reasonably send: the canonical
+// `phones: [...]` array, flat `phone1`..`phone4` keys, or the legacy
+// `phonePrimary`/`phoneBackup` pair — always returning exactly
+// CONTACT_PHONE_SLOTS entries (empty string for a vacant slot).
+function contactPhonesFromData(data) {
+  const raw = Array.isArray(data.phones)
+    ? data.phones
+    : [
+        data.phone1 !== undefined ? data.phone1 : data.phonePrimary,
+        data.phone2 !== undefined ? data.phone2 : data.phoneBackup,
+        data.phone3,
+        data.phone4,
+      ];
+  const out = [];
+  for (let i = 0; i < CONTACT_PHONE_SLOTS; i++) out.push(raw[i] == null ? '' : String(raw[i]));
+  return out;
+}
+
+// True when the payload carries ANY phone information at all (in any of the
+// shapes above) — the upsert merge uses this to tell "replace the stored
+// numbers with these" apart from "payload doesn't mention phones, keep them".
+function dataHasPhones(data) {
+  return Array.isArray(data.phones)
+    || data.phone1 !== undefined || data.phone2 !== undefined
+    || data.phone3 !== undefined || data.phone4 !== undefined
+    || data.phonePrimary !== undefined || data.phoneBackup !== undefined;
+}
+
+// The client code — the contact's durable unique identifier, assigned by the
+// external booking system (see POST /api/contacts/upsert). Stored trimmed;
+// empty means "no code" and is kept as NULL so the unique index ignores it.
+function normalizeContactCode(raw) {
+  const code = String(raw == null ? '' : raw).trim();
+  return code || null;
+}
+
 // Canonical display/storage form for a Uzbek local number: "90 601 03 31"
 // (2-3-2-2 grouping of the 9-digit subscriber number). Applied to every
 // contact phone field on the way in — from the settings UI, and from the
-// contacts-sync.js XML import alike — so there's exactly one format
+// /api/contacts/upsert import alike — so there's exactly one format
 // anywhere a number is stored, regardless of how it arrived ("+998 90
 // 601-03-31", "998906010331", already-clean, etc). Also duplicated (kept
 // in sync deliberately, see the AMI_DISPOSITION_LABELS comment above) in
@@ -211,8 +253,8 @@ function contactRowToJson(row) {
   if (!row) return null;
   return {
     id: row.id,
-    phonePrimary: row.phone_primary || '',
-    phoneBackup: row.phone_backup || '',
+    code: row.code || '',
+    phones: [row.phone1 || '', row.phone2 || '', row.phone3 || '', row.phone4 || ''],
     companyName: row.company_name || '',
     managerName: row.manager_name || '',
     operatorExtension: row.operator_extension || '',
@@ -281,9 +323,48 @@ class Db {
     this.db.function('upper', { deterministic: true }, (s) => (s == null ? null : String(s).toUpperCase()));
     this.db.exec(SCHEMA_SQL);
     this._migrateColumns();
+    this._migrateContacts();
     this._migrateBookingsUnique();
     this._prepare();
     this._backfillContactPhoneFormat();
+  }
+
+  // Contacts grew from 2 phone slots (phone_primary/phone_backup) to 4
+  // interchangeable ones (phone1..phone4), plus the client `code` — the
+  // durable unique identifier assigned by the external booking system. A
+  // fresh database gets the final shape straight from SCHEMA_SQL; one that
+  // predates this needs the old columns renamed and the new ones bolted on.
+  // The indexes are created here rather than in SCHEMA_SQL for the same
+  // reason as idx_calls_status above: against an old on-disk table the
+  // columns don't exist until this migration has run.
+  _migrateContacts() {
+    let cols = new Set(this.db.prepare('PRAGMA table_info(contacts)').all().map((c) => c.name));
+    if (cols.has('phone_primary')) {
+      this.db.exec(`
+        ALTER TABLE contacts RENAME COLUMN phone_primary TO phone1;
+        ALTER TABLE contacts RENAME COLUMN phone_primary_norm TO phone1_norm;
+        ALTER TABLE contacts RENAME COLUMN phone_backup TO phone2;
+        ALTER TABLE contacts RENAME COLUMN phone_backup_norm TO phone2_norm;
+      `);
+      // SQLite carried the old indexes over to the renamed columns — drop
+      // them so the uniformly-named ones below are the only copies.
+      this.db.exec('DROP INDEX IF EXISTS idx_contacts_phone_primary_norm;');
+      this.db.exec('DROP INDEX IF EXISTS idx_contacts_phone_backup_norm;');
+      console.log('[db] migrated contacts phone_primary/phone_backup to phone1/phone2');
+      cols = new Set(this.db.prepare('PRAGMA table_info(contacts)').all().map((c) => c.name));
+    }
+    for (const col of ['code', 'phone3', 'phone3_norm', 'phone4', 'phone4_norm']) {
+      if (!cols.has(col)) this.db.exec(`ALTER TABLE contacts ADD COLUMN ${col} TEXT`);
+    }
+    for (let i = 1; i <= CONTACT_PHONE_SLOTS; i++) {
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_phone${i}_norm ON contacts(phone${i}_norm)`);
+    }
+    // Partial: rows without a code (NULL) don't collide with each other —
+    // only actually-assigned codes must be unique.
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_code_unique
+      ON contacts(code) WHERE code IS NOT NULL
+    `);
   }
 
   // A resubmitted booking for a call id that already has one now updates it
@@ -316,13 +397,13 @@ class Db {
   // fields through the same formatter createContact/updateContact use, so
   // "strictly 90 601 03 31 everywhere" also covers rows already on disk.
   _backfillContactPhoneFormat() {
-    const rows = this.db.prepare('SELECT id, phone_primary, phone_backup FROM contacts').all();
+    const rows = this.db.prepare('SELECT id, phone1, phone2, phone3, phone4 FROM contacts').all();
     let changed = 0;
     for (const row of rows) {
-      const primary = formatPhoneStrict(row.phone_primary);
-      const backup = formatPhoneStrict(row.phone_backup);
-      if (primary === (row.phone_primary || '') && backup === (row.phone_backup || '')) continue;
-      this.stmts.updateContactPhoneFormat.run(primary || null, backup || null, row.id);
+      const current = [row.phone1, row.phone2, row.phone3, row.phone4];
+      const formatted = current.map(formatPhoneStrict);
+      if (formatted.every((p, i) => p === (current[i] || ''))) continue;
+      this.stmts.updateContactPhoneFormat.run(...formatted.map((p) => p || null), row.id);
       changed++;
     }
     if (changed) console.log(`[db] reformatted phone numbers for ${changed} existing contact(s)`);
@@ -407,26 +488,33 @@ class Db {
       `),
       findContactByNorm: db.prepare(`
         SELECT id FROM contacts
-        WHERE (phone_primary_norm IS NOT NULL AND phone_primary_norm = ?)
-           OR (phone_backup_norm IS NOT NULL AND phone_backup_norm = ?)
+        WHERE (phone1_norm IS NOT NULL AND phone1_norm = ?)
+           OR (phone2_norm IS NOT NULL AND phone2_norm = ?)
+           OR (phone3_norm IS NOT NULL AND phone3_norm = ?)
+           OR (phone4_norm IS NOT NULL AND phone4_norm = ?)
         LIMIT 1
       `),
+      findContactByCode: db.prepare('SELECT * FROM contacts WHERE code = ? LIMIT 1'),
       insertContact: db.prepare(`
         INSERT INTO contacts (
-          phone_primary, phone_primary_norm, phone_backup, phone_backup_norm,
+          code,
+          phone1, phone1_norm, phone2, phone2_norm,
+          phone3, phone3_norm, phone4, phone4_norm,
           company_name, manager_name, operator_extension, comment,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `),
       updateContact: db.prepare(`
         UPDATE contacts SET
-          phone_primary = ?, phone_primary_norm = ?, phone_backup = ?, phone_backup_norm = ?,
+          code = ?,
+          phone1 = ?, phone1_norm = ?, phone2 = ?, phone2_norm = ?,
+          phone3 = ?, phone3_norm = ?, phone4 = ?, phone4_norm = ?,
           company_name = ?, manager_name = ?, operator_extension = ?, comment = ?, updated_at = ?
         WHERE id = ?
       `),
       getContact: db.prepare('SELECT * FROM contacts WHERE id = ?'),
       deleteContact: db.prepare('DELETE FROM contacts WHERE id = ?'),
-      updateContactPhoneFormat: db.prepare('UPDATE contacts SET phone_primary = ?, phone_backup = ? WHERE id = ?'),
+      updateContactPhoneFormat: db.prepare('UPDATE contacts SET phone1 = ?, phone2 = ?, phone3 = ?, phone4 = ? WHERE id = ?'),
       insertNote: db.prepare(`
         INSERT INTO notes (id, call_id, contact_id, number, name, text, operator_extension, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -462,7 +550,7 @@ class Db {
   resolveContactIdForNumber(number) {
     const norm = normalizePhone(number);
     if (!norm) return null;
-    const row = this.stmts.findContactByNorm.get(norm, norm);
+    const row = this.stmts.findContactByNorm.get(norm, norm, norm, norm);
     return row ? row.id : null;
   }
 
@@ -471,35 +559,88 @@ class Db {
     this.stmts.touchContactLastCall.run(startedAt, Date.now(), contactId);
   }
 
+  // Both share the same parameter layout: code, then the 4 phone slots as
+  // (display, norm) pairs, then the plain text fields.
+  _contactParams(data) {
+    const params = [normalizeContactCode(data.code)];
+    for (const phone of contactPhonesFromData(data)) {
+      params.push(formatPhoneStrict(phone) || null, normalizePhone(phone));
+    }
+    params.push(
+      data.companyName || null, data.managerName || null,
+      data.operatorExtension || null, data.comment || null
+    );
+    return params;
+  }
+
   createContact(data) {
     const now = Date.now();
-    const primaryNorm = normalizePhone(data.phonePrimary);
-    const backupNorm = normalizePhone(data.phoneBackup);
-    const info = this.stmts.insertContact.run(
-      formatPhoneStrict(data.phonePrimary) || null, primaryNorm,
-      formatPhoneStrict(data.phoneBackup) || null, backupNorm,
-      data.companyName || null, data.managerName || null,
-      data.operatorExtension || null, data.comment || null,
-      now, now
-    );
+    const info = this.stmts.insertContact.run(...this._contactParams(data), now, now);
     return this.getContact(info.lastInsertRowid);
   }
 
   updateContact(id, data) {
-    const primaryNorm = normalizePhone(data.phonePrimary);
-    const backupNorm = normalizePhone(data.phoneBackup);
-    this.stmts.updateContact.run(
-      formatPhoneStrict(data.phonePrimary) || null, primaryNorm,
-      formatPhoneStrict(data.phoneBackup) || null, backupNorm,
-      data.companyName || null, data.managerName || null,
-      data.operatorExtension || null, data.comment || null,
-      Date.now(), id
-    );
+    this.stmts.updateContact.run(...this._contactParams(data), Date.now(), id);
     return this.getContact(id);
+  }
+
+  // Import path for an external system (POST /api/contacts/upsert): the
+  // client code is the durable identifier — a row already carrying it is
+  // updated in place; re-sending the same code any number of times keeps
+  // updating that same contact. Only keys actually present in `data`
+  // overwrite the stored value (phones replace as a whole set when any
+  // phone key is given — see dataHasPhones), so a partial payload can't
+  // blank out fields the operators maintain by hand.
+  upsertContactByCode(data) {
+    const code = normalizeContactCode(data.code);
+    if (!code) throw new Error('"code" is required');
+    let existingRow = this.stmts.findContactByCode.get(code);
+    let adopted = false;
+
+    // The code is new to us — but the phone number may not be: the contact
+    // book predates codes (manual entries, the old XML sync), so a CODE-LESS
+    // contact matching one of the payload's numbers is this same client and
+    // should get the code attached, not be duplicated. A contact already
+    // carrying a different code is never adopted (that's a different client
+    // who happens to share a number — a data-quality case, not ours to merge).
+    if (!existingRow) {
+      for (const phone of contactPhonesFromData(data)) {
+        const norm = normalizePhone(phone);
+        if (!norm) continue;
+        const match = this.stmts.findContactByNorm.get(norm, norm, norm, norm);
+        if (!match) continue;
+        const full = this.stmts.getContact.get(match.id);
+        if (full && !normalizeContactCode(full.code)) {
+          existingRow = full;
+          adopted = true;
+          break;
+        }
+      }
+    }
+
+    if (!existingRow) {
+      return { contact: this.createContact({ ...data, code }), created: true, adopted: false };
+    }
+    const current = contactRowToJson(existingRow);
+    const merged = {
+      code,
+      phones: dataHasPhones(data) ? contactPhonesFromData(data) : current.phones,
+      companyName: data.companyName !== undefined ? data.companyName : current.companyName,
+      managerName: data.managerName !== undefined ? data.managerName : current.managerName,
+      operatorExtension: data.operatorExtension !== undefined ? data.operatorExtension : current.operatorExtension,
+      comment: data.comment !== undefined ? data.comment : current.comment,
+    };
+    return { contact: this.updateContact(current.id, merged), created: false, adopted };
   }
 
   getContact(id) {
     return contactRowToJson(this.stmts.getContact.get(id));
+  }
+
+  getContactByCode(code) {
+    const normalized = normalizeContactCode(code);
+    if (!normalized) return null;
+    return contactRowToJson(this.stmts.findContactByCode.get(normalized));
   }
 
   deleteContact(id) {
@@ -513,12 +654,12 @@ class Db {
       const like = '%' + q.trim().toLowerCase() + '%';
       const digits = normalizePhone(q);
       clauses.push(`(
-        lower(company_name) LIKE ? OR lower(manager_name) LIKE ? OR
-        lower(phone_primary) LIKE ? OR lower(phone_backup) LIKE ?
-        ${digits ? 'OR phone_primary_norm LIKE ? OR phone_backup_norm LIKE ?' : ''}
+        lower(company_name) LIKE ? OR lower(manager_name) LIKE ? OR lower(code) LIKE ? OR
+        lower(phone1) LIKE ? OR lower(phone2) LIKE ? OR lower(phone3) LIKE ? OR lower(phone4) LIKE ?
+        ${digits ? 'OR phone1_norm LIKE ? OR phone2_norm LIKE ? OR phone3_norm LIKE ? OR phone4_norm LIKE ?' : ''}
       )`);
-      params.push(like, like, like, like);
-      if (digits) params.push('%' + digits + '%', '%' + digits + '%');
+      params.push(like, like, like, like, like, like, like);
+      if (digits) params.push('%' + digits + '%', '%' + digits + '%', '%' + digits + '%', '%' + digits + '%');
     }
     const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : '';
     const total = this.db.prepare(`SELECT COUNT(*) AS c FROM contacts ${where}`).get(...params).c;
@@ -636,8 +777,10 @@ class Db {
     // or duplicate rows).
     const join = `
       LEFT JOIN contacts ct ON ct.id = c.contact_id
-        OR ct.phone_primary_norm = c.counterparty_number_norm
-        OR ct.phone_backup_norm = c.counterparty_number_norm
+        OR ct.phone1_norm = c.counterparty_number_norm
+        OR ct.phone2_norm = c.counterparty_number_norm
+        OR ct.phone3_norm = c.counterparty_number_norm
+        OR ct.phone4_norm = c.counterparty_number_norm
     `;
     const total = this.db.prepare(`
       SELECT COUNT(*) AS c FROM (
@@ -667,7 +810,9 @@ class Db {
     // contact existed never got contact_id stamped on it, but should still
     // show up here once the phone number matches.
     const contact = this.stmts.getContact.get(contactId);
-    const norms = contact ? [contact.phone_primary_norm, contact.phone_backup_norm].filter(Boolean) : [];
+    const norms = contact
+      ? [contact.phone1_norm, contact.phone2_norm, contact.phone3_norm, contact.phone4_norm].filter(Boolean)
+      : [];
     const clauses = ['c.contact_id = ?'];
     const params = [contactId];
     for (const norm of norms) {
