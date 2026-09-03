@@ -33,6 +33,11 @@ class CallStore extends EventEmitter {
     super();
     this.channelTech = channelTech;
     this.trackExtensions = trackExtensions;
+    // No explicit list (or a "*" in it) = watch every internal extension
+    // the PBX has, not a hand-maintained subset. This is what makes calls
+    // placed/answered on the operators' own SIP phones (MicroSIP) show up
+    // for every operator, including ones added after this was configured.
+    this.autoTrack = !trackExtensions.length || trackExtensions.includes('*');
     this.db = db;
 
     this.records = new Map(); // recordId -> record
@@ -51,7 +56,12 @@ class CallStore extends EventEmitter {
     ami.on('event:Newchannel', (e) => this._onNewchannel(e));
     ami.on('event:Newexten', (e) => this._onNewexten(e));
     ami.on('event:Newstate', (e) => this._onNewstate(e));
+    // Asterisk <= 11 emits one "Dial" event with SubEvent Begin/End; 12+
+    // (this PBX — AMI 11.0.0 banner, DestChannel/DialString fields) emits
+    // separate DialBegin/DialEnd. Same handlers, both spellings.
     ami.on('event:Dial', (e) => this._onDial(e));
+    ami.on('event:DialBegin', (e) => this._onDialBegin(e));
+    ami.on('event:DialEnd', (e) => this._onDialEnd(e));
     ami.on('event:Hangup', (e) => this._onHangup(e));
   }
 
@@ -145,10 +155,20 @@ class CallStore extends EventEmitter {
   /* Channel-name helpers                                               */
   /* ---------------------------------------------------------------- */
 
+  // Channel name -> the tracked extension it belongs to, or null. Any
+  // channel technology is accepted (mixed PJSIP/SIP installs exist and
+  // AMI_CHANNEL_TECH only matters for our own Originate). In auto mode
+  // every internal-extension-looking channel counts: 2..5 digits right
+  // after "TECH/", which keeps trunk channels (named after the provider,
+  // or a long account number) and Local/... legs out.
   _matchTrackedExtension(channelName) {
     if (!channelName) return null;
+    if (this.autoTrack) {
+      const m = /^[A-Za-z0-9_]+\/(\d{2,5})-/.exec(channelName);
+      return m ? m[1] : null;
+    }
     for (const ext of this.trackExtensions) {
-      const re = new RegExp(`^${this.channelTech}/${ext}-`, 'i');
+      const re = new RegExp(`^[A-Za-z0-9_]+/${ext.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-`, 'i');
       if (re.test(channelName)) return ext;
     }
     return null;
@@ -236,6 +256,15 @@ class CallStore extends EventEmitter {
 
     for (const record of this.records.values()) {
       if (record.endedAt || !record.linkedid || record.linkedid !== Linkedid) continue;
+      // Only an OUTGOING call has a "destination" leg to discover. An
+      // inbound ring-group call shares one Linkedid across every operator
+      // channel it rings — adopting PJSIP/102 as the destination of 101's
+      // record would credit 101 with the answer when 102 picks up (and
+      // leave 102 with no record at all). Another operator's own channel
+      // is never our destination, even for an internal extension-to-
+      // extension call: they get their own inbound record via _onNewstate.
+      if (record.direction !== 'outgoing') continue;
+      if (this._matchTrackedExtension(Channel)) continue;
       if (record.channels.operator === Channel || record.channels.destination) continue;
       record.channels.destination = Channel;
       this.byUniqueid.set(Uniqueid, record.id);
@@ -292,13 +321,46 @@ class CallStore extends EventEmitter {
   // event is coming (established for this PBX), so this Newstate is the
   // first reliable signal we get that it's actually inbound.
   _maybeDetectInboundFromNewstate(evt) {
-    const { Channel, Uniqueid, Linkedid, ConnectedLineNum, ConnectedLineName, ChannelStateDesc } = evt;
+    const { Channel, Uniqueid, Linkedid, Exten, ConnectedLineNum, ConnectedLineName, ChannelStateDesc } = evt;
     const ext = this._matchTrackedExtension(Channel);
     if (!ext) return;
-    const callerNum = ConnectedLineNum && ConnectedLineNum !== '<unknown>' ? ConnectedLineNum : null;
-    // Not populated yet, or just reflects the extension's own identity
-    // (e.g. an outgoing leg we don't otherwise recognize) — not inbound.
-    if (!callerNum || callerNum === ext) return;
+    const connected = ConnectedLineNum && ConnectedLineNum !== '<unknown>' ? ConnectedLineNum : null;
+    const name = ConnectedLineName && ConnectedLineName !== '<unknown>' ? ConnectedLineName : '';
+
+    // Asterisk invariant: Linkedid is the Uniqueid of the channel that
+    // STARTED the call. So when this extension's own channel is the linked
+    // one, the operator dialed out from their phone (an outgoing call
+    // _onNewchannel couldn't classify, e.g. Exten was still "s" there);
+    // otherwise some other leg (trunk/queue) created it — inbound.
+    const isOriginator = !!Linkedid && Linkedid === Uniqueid;
+    if (isOriginator) {
+      const dialed = (connected && connected !== ext) ? connected
+        : (Exten && Exten !== 's' && Exten !== ext ? Exten : null);
+      if (!dialed) return; // nothing identifies the destination yet
+      const record = this._newRecord({
+        id: Uniqueid,
+        linkedid: Linkedid,
+        operatorExtension: ext,
+        direction: 'outgoing',
+        source: 'manual',
+        counterpartyNumber: dialed,
+        startedAt: Date.now(),
+      });
+      record.channels.operator = Channel;
+      this.byUniqueid.set(Uniqueid, record.id);
+      if (ChannelStateDesc === 'Up') {
+        record.state = 'answered';
+        record.answeredAt = Date.now();
+      } else {
+        record.state = 'ringing_destination';
+      }
+      this._emitUpdate(record);
+      return;
+    }
+
+    // Not populated yet, or just reflects the extension's own identity —
+    // nothing to identify the caller by; a later Newstate will carry it.
+    if (!connected || connected === ext) return;
 
     const record = this._newRecord({
       id: Uniqueid,
@@ -306,8 +368,8 @@ class CallStore extends EventEmitter {
       operatorExtension: ext,
       direction: 'incoming',
       source: 'manual',
-      counterpartyNumber: callerNum,
-      counterpartyName: ConnectedLineName && ConnectedLineName !== '<unknown>' ? ConnectedLineName : '',
+      counterpartyNumber: connected,
+      counterpartyName: name,
       startedAt: Date.now(),
     });
     record.channels.operator = Channel;
@@ -347,7 +409,8 @@ class CallStore extends EventEmitter {
   }
 
   _onDialBegin(evt) {
-    const { Channel, Destination, Uniqueid, DestUniqueid, CallerIDNum, CallerIDName } = evt;
+    const { Channel, Uniqueid, DestUniqueid, CallerIDNum, CallerIDName } = evt;
+    const Destination = evt.DestChannel || evt.Destination; // 12+ vs legacy field name
 
     // Case 1: continuation of a call we originated (operator leg now dialing out).
     const existingId = this.byUniqueid.get(Uniqueid);
@@ -365,7 +428,7 @@ class CallStore extends EventEmitter {
     // one of our tracked extensions dialing out.
     const outExt = this._matchTrackedExtension(Channel);
     if (outExt) {
-      const number = this._resolveDialedNumber(Channel, Destination);
+      const number = this._resolveDialedNumber(Channel, Destination, evt.DialString);
       const record = this._newRecord({
         id: Uniqueid,
         linkedid: evt.Linkedid,
@@ -429,14 +492,28 @@ class CallStore extends EventEmitter {
     if (!record || record.endedAt) return;
 
     if (evt.DialStatus === 'ANSWER') {
+      // Newstate("Up") on the right leg usually got here first — keep the
+      // earlier answer timestamp in that case.
+      if (record.state === 'answered') return;
       record.state = 'answered';
       record.answeredAt = Date.now();
-    } else {
-      record.state = 'failed';
-      record.disposition = evt.DialStatus || 'FAILED';
-      record.endedAt = Date.now();
-      this._hangupOperatorLegOnDialFailure(record);
+      this._emitUpdate(record);
+      return;
     }
+
+    // BUSY / NOANSWER / CANCEL / CONGESTION / CHANUNAVAIL. For an INBOUND
+    // ring-group/queue call the losing members all get DialEnd(CANCEL) the
+    // moment a colleague answers — that verdict belongs to Hangup, whose
+    // cause 26 tells "answered elsewhere" apart from a real miss (see
+    // _onHangup). For an outgoing call this is the definitive failure.
+    if (record.direction !== 'outgoing') return;
+    record.state = 'failed';
+    record.disposition = evt.DialStatus || 'FAILED';
+    record.endedAt = Date.now();
+    // Only for calls we placed ourselves: a MicroSIP user who dialed by
+    // hand expects their phone to behave like a phone (busy tone etc.),
+    // not to be hung up from outside.
+    if (record.source === 'click2call') this._hangupOperatorLegOnDialFailure(record);
     this._emitUpdate(record);
   }
 
@@ -478,20 +555,50 @@ class CallStore extends EventEmitter {
       this._maybeDetectInboundFromNewstate(evt);
       return;
     }
-    if (evt.ChannelStateDesc !== 'Up') return;
-
     const record = this.records.get(recordId);
-    if (!record || record.endedAt || record.state === 'answered') return;
+    if (!record || record.endedAt) return;
 
-    // For an outgoing call (click2call or manual), the operator's own leg
-    // going "Up" just means the operator picked up their phone — the
+    // A record created from DialBegin (queue/ring-group leg) may have had
+    // no usable caller id/name yet — Asterisk fills ConnectedLine* in by
+    // the time the operator's channel actually rings, so pick it up here.
+    if (record.direction === 'incoming') {
+      const connected = evt.ConnectedLineNum;
+      const connectedName = evt.ConnectedLineName && evt.ConnectedLineName !== '<unknown>' ? evt.ConnectedLineName : '';
+      let changed = false;
+      if (record.counterparty.number === 'неизвестно' && connected && connected !== '<unknown>' && connected !== record.operatorExtension) {
+        record.counterparty.number = connected;
+        changed = true;
+      }
+      if (!record.counterparty.name && connectedName && connectedName !== record.counterparty.number) {
+        record.counterparty.name = connectedName;
+        changed = true;
+      }
+      if (changed) this._emitUpdate(record);
+    }
+
+    if (evt.ChannelStateDesc !== 'Up') return;
+    if (record.state === 'answered') return;
+
+    // For a click2call outgoing call the operator's own leg going "Up" just
+    // means the operator picked up their phone (we Originate'd it) — the
     // client hasn't answered yet at that point. Only the destination leg
     // (the second channel, registered in _onNewchannel once it appears)
-    // going "Up" means the client actually answered. If we don't know the
+    // going "Up" means the client actually answered; if we don't know the
     // destination leg yet, wait rather than guess.
+    //
+    // A MANUAL outgoing call (dialed on the operator's SIP phone) is
+    // different: that leg is already off-hook from the start, so it only
+    // goes "Up" when the dialplan bridges it — i.e. when the far end
+    // answers. With a destination leg in sight we still prefer its "Up"
+    // (more precise); without one — trunk legs aren't always visible over
+    // AMI — the operator leg's own "Up" is the answer signal, consistent
+    // with how _onHangup already judges single-leg calls.
     if (record.direction === 'outgoing') {
-      if (!record.channels.destination) return;
-      if (evt.Channel !== record.channels.destination) return;
+      if (record.channels.destination) {
+        if (evt.Channel !== record.channels.destination) return;
+      } else if (record.source !== 'manual') {
+        return;
+      }
     }
 
     record.state = 'answered';
@@ -520,6 +627,13 @@ class CallStore extends EventEmitter {
       record.state = 'ended';
       record.disposition = 'ANSWER';
       if (!record.answeredAt) record.answeredAt = record.endedAt; // best guess: no exact answer time available
+    } else if (evt.Cause === '26' && record.direction === 'incoming') {
+      // Ring group / queue: this operator's phone rang but a colleague
+      // picked up first. Not a missed call for anyone — kept as its own
+      // disposition so stats/UI don't count it as "Пропущенные" (see
+      // deriveStatus in db.js and amiRecordToEntry in js/app.js).
+      record.state = 'failed';
+      record.disposition = 'ANSWERED_ELSEWHERE';
     } else {
       record.state = 'failed';
       record.disposition = record.disposition || evt['Cause-txt'] || 'NOANSWER';
@@ -532,7 +646,13 @@ class CallStore extends EventEmitter {
   /* Internals                                                          */
   /* ---------------------------------------------------------------- */
 
-  _resolveDialedNumber(channel, destinationChannel) {
+  _resolveDialedNumber(channel, destinationChannel, dialString) {
+    // Asterisk 12+ DialBegin carries the exact dial target, e.g.
+    // "937277270@557056666" (number@trunk) or "PJSIP/937277270@trunk".
+    if (dialString) {
+      const local = String(dialString).split('@')[0].split('/').pop();
+      if (/^\+?\d{3,}$/.test(local)) return local;
+    }
     const meta = this.lastExtenByChannel.get(channel);
     if (meta && meta.exten && meta.exten !== 's') return meta.exten;
     if (meta && meta.app === 'Dial' && meta.appData) {

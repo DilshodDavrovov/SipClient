@@ -443,7 +443,8 @@ function renderStats(list) {
     if (entry.status === 'completed') {
       handled++;
       totalDuration += entry.duration || 0;
-    } else if (entry.status !== 'active' && entry.status !== 'ringing') {
+    } else if (entry.status !== 'active' && entry.status !== 'ringing' && entry.status !== 'elsewhere') {
+      // 'elsewhere' = a colleague took that ring-group call; not a miss.
       missed++;
     }
   }
@@ -510,6 +511,7 @@ function buildHistoryRowsHtml(list) {
     let badgeClass = '';
     if (entry.status === 'completed') badgeClass = 'ok';
     else if (entry.status === 'missed' || entry.status === 'failed') badgeClass = 'missed';
+    else if (entry.status === 'elsewhere') badgeClass = 'neutral';
     else badgeClass = 'warn';
 
     const playCell = entry.id
@@ -1533,6 +1535,7 @@ function renderContactHistory(records) {
     let badgeClass = 'warn';
     if (entry.status === 'completed') badgeClass = 'ok';
     else if (entry.status === 'missed' || entry.status === 'failed') badgeClass = 'missed';
+    else if (entry.status === 'elsewhere') badgeClass = 'neutral';
 
     const playCell = entry.id
       ? `<button class="play-recording-btn" data-recording-id="${escapeHtml(entry.id)}" data-recording-label="${escapeHtml(entry.number)}" title="Прослушать запись">${ICONS.play}</button>`
@@ -1676,6 +1679,9 @@ function amiRecordToEntry(r) {
     case 'operator_no_answer':
       status = 'missed'; statusLabel = 'Вы не ответили'; break;
     case 'failed':
+      // Ring group / queue call a colleague answered first — neither missed
+      // nor failed (same mapping as deriveStatus in server/src/db.js).
+      if (r.disposition === 'ANSWERED_ELSEWHERE') { status = 'elsewhere'; statusLabel = 'Ответил другой оператор'; break; }
       status = 'failed'; statusLabel = AMI_DISPOSITION_LABELS[r.disposition] || 'Не завершён'; break;
     default:
       status = 'ringing'; statusLabel = 'Звонит...';

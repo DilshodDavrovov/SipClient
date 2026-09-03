@@ -591,6 +591,8 @@ body {
 .status-badge.ok { color: var(--green-hover); background: #e2f4e2; }
 .status-badge.missed { color: var(--red-hover); background: #f9e8e8; }
 .status-badge.warn { color: var(--yellow); background: #faf0db; }
+/* Ring-group call a colleague answered first: informational, not a miss. */
+.status-badge.neutral { color: var(--text-dim); background: #ececec; }
 
 .empty-row td {
   text-align: center;

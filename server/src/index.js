@@ -40,7 +40,11 @@ for (const [name, value] of Object.entries({ AMI_HOST, AMI_USERNAME, AMI_SECRET,
   }
 }
 
+// "*" (or nothing at all) = every internal extension the PBX has — see
+// CallStore's autoTrack. An explicit comma-separated list still works for
+// the rare case where only a subset should ever be watched.
 const trackExtensions = TRACK_EXTENSIONS.split(',').map((s) => s.trim()).filter(Boolean);
+const trackAll = !trackExtensions.length || trackExtensions.includes('*');
 
 const path = require('path');
 const dbFile = path.join(__dirname, '..', 'data', 'app.db');
@@ -61,7 +65,9 @@ callStore.attach(ami);
 // Diagnostics while we bring up click-to-call — logs only events touching a
 // tracked extension's own channel (never the whole PBX's traffic, which
 // carries other agents' real customer calls). Safe to remove once reliable.
-const DEBUG_CHANNEL_RE = new RegExp(`^${AMI_CHANNEL_TECH}/(${trackExtensions.join('|')})-`, 'i');
+const DEBUG_CHANNEL_RE = trackAll
+  ? /^[A-Za-z0-9_]+\/\d{2,5}-/
+  : new RegExp(`^[A-Za-z0-9_]+/(${trackExtensions.map((e) => e.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})-`, 'i');
 function isDebugRelevant(e) {
   return DEBUG_CHANNEL_RE.test(e.Channel || '') || DEBUG_CHANNEL_RE.test(e.Destination || '');
 }
@@ -75,7 +81,7 @@ let amiConnected = false;
 ami.on('banner', (b) => console.log('[ami] connected to', `${AMI_HOST}:${AMI_PORT}`, '-', b));
 ami.on('connected', () => {
   amiConnected = true;
-  console.log('[ami] login OK, watching extensions:', trackExtensions.join(', ') || '(none configured)');
+  console.log('[ami] login OK, watching extensions:', trackAll ? 'all internal extensions (auto)' : trackExtensions.join(', '));
   // Every (re)connect is exactly when a call could have hung up while we
   // weren't listening — reconcile before anything else touches call state.
   ami.listActiveChannels()
@@ -115,7 +121,7 @@ function requireApiKey(req, res, next) {
 }
 
 app.get('/api/status', requireApiKey, (req, res) => {
-  res.json({ amiConnected, trackExtensions });
+  res.json({ amiConnected, trackExtensions: trackAll ? ['*'] : trackExtensions });
 });
 
 app.get('/api/calls', requireApiKey, (req, res) => {
@@ -646,7 +652,10 @@ wss.on('connection', (ws, req) => {
     ws.close(4401, 'invalid token');
     return;
   }
-  ws.send(JSON.stringify({ type: 'snapshot', records: callStore.list(100), amiConnected }));
+  // The whole in-memory working set, not just the last 100: with every
+  // extension tracked, one operator's own recent calls are a thin slice
+  // of the total, and the browser filters this down to its extension.
+  ws.send(JSON.stringify({ type: 'snapshot', records: callStore.list(300), amiConnected }));
 });
 
 function broadcast(payload) {

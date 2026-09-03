@@ -201,7 +201,12 @@ function deriveStatus(record) {
     case 'answered': return { status: 'active', statusLabel: 'В разговоре' };
     case 'ended': return { status: 'completed', statusLabel: 'Завершён' };
     case 'operator_no_answer': return { status: 'missed', statusLabel: 'Вы не ответили' };
-    case 'failed': return { status: 'failed', statusLabel: AMI_DISPOSITION_LABELS[record.disposition] || 'Не завершён' };
+    case 'failed':
+      // Ring group / queue call a colleague answered first (Hangup cause 26
+      // on this operator's leg, see call-store.js _onHangup) — its own
+      // status so it is neither "missed" nor "failed" in stats and lists.
+      if (record.disposition === 'ANSWERED_ELSEWHERE') return { status: 'elsewhere', statusLabel: 'Ответил другой оператор' };
+      return { status: 'failed', statusLabel: AMI_DISPOSITION_LABELS[record.disposition] || 'Не завершён' };
     default: return { status: 'ringing', statusLabel: 'Звонит...' };
   }
 }
@@ -430,6 +435,16 @@ class Db {
   // forever. Cheap to run unconditionally on every boot: a no-op once
   // everything already has a status.
   _backfillStatus() {
+    // Rows written before cause 26 got its own disposition carry the raw
+    // Asterisk cause text and a "failed" status; fold them into the new
+    // ANSWERED_ELSEWHERE shape so history and stats treat them the same
+    // way as new ones. Idempotent — matches nothing once done.
+    const folded = this.db.prepare(`
+      UPDATE calls SET disposition = 'ANSWERED_ELSEWHERE', status = 'elsewhere', status_label = 'Ответил другой оператор'
+      WHERE disposition = 'Answered elsewhere' AND direction = 'incoming'
+    `).run();
+    if (folded.changes) console.log(`[db] reclassified ${folded.changes} "answered elsewhere" call(s)`);
+
     const rows = this.db.prepare('SELECT id, state, disposition FROM calls WHERE status IS NULL').all();
     if (!rows.length) return;
     const update = this.db.prepare('UPDATE calls SET status = ?, status_label = ? WHERE id = ?');
