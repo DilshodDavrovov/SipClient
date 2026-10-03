@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Админ-панель — регионы и маршрутизация</title>
+  <style>
+    :root{
+      --bg:#f4f6f8; --card:#fff; --ink:#1e2a32; --muted:#6b7a86; --line:#dfe6ea;
+      --accent:#1f9d7a; --accent-d:#177c60; --danger:#c0392b; --danger-bg:#fdecea;
+      --head:#e7efec; --row:#fafbfc;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font:14px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+    header{background:var(--card);border-bottom:1px solid var(--line);padding:12px 20px;display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center}
+    header h1{font-size:16px;margin:0;font-weight:600;margin-right:auto}
+    .conn{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .conn input{padding:6px 8px;border:1px solid var(--line);border-radius:6px;font:inherit}
+    .conn input#backendUrl{width:210px}.conn input#apiKey{width:180px}
+    .dot{width:9px;height:9px;border-radius:50%;background:#bbb;display:inline-block}
+    .dot.ok{background:var(--accent)}.dot.err{background:var(--danger)}
+    main{max-width:1180px;margin:18px auto;padding:0 20px}
+    .tabs{display:flex;gap:6px;margin-bottom:14px}
+    .tabs button{padding:8px 16px;border:1px solid var(--line);background:var(--card);border-radius:8px 8px 0 0;cursor:pointer;font:inherit;color:var(--muted)}
+    .tabs button.active{color:var(--ink);border-bottom-color:var(--card);font-weight:600;background:var(--card)}
+    .panel{display:none;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px}
+    .panel.active{display:block}
+    h2{font-size:15px;margin:0 0 12px}
+    button.btn{padding:8px 14px;border:0;border-radius:7px;background:var(--accent);color:#fff;cursor:pointer;font:inherit;font-weight:600}
+    button.btn:hover{background:var(--accent-d)}
+    button.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+    button.btn.small{padding:4px 9px;font-size:12.5px;font-weight:500}
+    button.btn.danger{background:transparent;color:var(--danger);border:1px solid #eecfca}
+    button.btn.danger:hover{background:var(--danger-bg)}
+    table{width:100%;border-collapse:collapse;margin-top:6px;font-size:13.5px}
+    th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+    thead th{background:var(--head);font-weight:600;position:sticky;top:0}
+    tbody tr:nth-child(even){background:var(--row)}
+    .muted{color:var(--muted)}
+    .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+    select,input.f{padding:7px 9px;border:1px solid var(--line);border-radius:6px;font:inherit;background:#fff}
+    label.fld{display:flex;flex-direction:column;gap:4px;font-size:12.5px;color:var(--muted)}
+    label.fld input,label.fld select{margin-top:2px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px;margin-bottom:14px}
+    .note{font-size:12.5px;color:var(--muted);margin:6px 0}
+    .msg{padding:9px 12px;border-radius:7px;margin:10px 0;font-size:13px;display:none}
+    .msg.ok{background:#e8f6f0;color:var(--accent-d);display:block}
+    .msg.err{background:var(--danger-bg);color:var(--danger);display:block}
+    .stat{display:inline-block;background:var(--head);border-radius:20px;padding:3px 10px;margin-right:6px;font-size:12.5px}
+    .modal-bg{position:fixed;inset:0;background:rgba(20,30,36,.45);display:none;align-items:center;justify-content:center;padding:16px}
+    .modal-bg.show{display:flex}
+    .modal{background:#fff;border-radius:12px;padding:20px;width:min(560px,100%);max-height:90vh;overflow:auto}
+    .modal h3{margin:0 0 14px;font-size:15px}
+    .modal .grid{grid-template-columns:1fr 1fr}
+    .modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
+    .preview-wrap{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:8px;margin-top:8px}
+    .pill{font-size:11.5px;background:#eef3f1;border:1px solid var(--line);border-radius:5px;padding:1px 6px;margin:1px}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Админ-панель · регионы и маршрутизация</h1>
+    <div class="conn">
+      <span class="dot" id="statusDot"></span>
+      <input id="backendUrl" placeholder="http://localhost:3001" />
+      <input id="apiKey" type="password" placeholder="API-ключ" />
+      <button class="btn small" id="connectBtn">Подключить</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="tabs">
+      <button data-tab="regions" class="active">Регионы</button>
+      <button data-tab="sync">Синхронизация 1C</button>
+      <button data-tab="contacts">Контакты по региону</button>
+    </div>
+
+    <!-- REGIONS -->
+    <section class="panel active" id="panel-regions">
+      <div class="toolbar">
+        <h2 style="margin:0;margin-right:auto">Регионы (виловят → транк · очередь · агенты)</h2>
+        <button class="btn" id="addRegionBtn">+ Добавить регион</button>
+      </div>
+      <p class="note"><b>Outbound:</b> префикс подставляется к номеру, чтобы FreePBX выбрал транк региона через Outbound Route. <b>Inbound:</b> когда на один DID звонят контакты разных регионов, звонок направляется во «Вх. назначение» по номеру звонящего (то, что FreePBX сам по DID сделать не может).</p>
+      <div id="regionsTableWrap"></div>
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+        <h2>Тест входящей маршрутизации</h2>
+        <p class="note">Введите номер звонящего (как придёт CallerID) и, при желании, DID — увидите, в какое назначение уйдёт звонок. Тот же ответ вернёт дайлплан.</p>
+        <div class="toolbar">
+          <input class="f" id="testNumber" placeholder="номер звонящего, напр. 901112233" style="width:240px" />
+          <input class="f" id="testDid" placeholder="DID (необязательно)" style="width:180px" />
+          <button class="btn small" id="testRouteBtn">Проверить</button>
+        </div>
+        <div class="msg" id="testMsg"></div>
+      </div>
+    </section>
+
+    <!-- 1C SYNC -->
+    <section class="panel" id="panel-sync">
+      <div class="toolbar">
+        <h2 style="margin:0;margin-right:auto">Синхронизация контактов из 1C</h2>
+        <button class="btn small ghost" id="refreshSyncBtn">Обновить статус</button>
+        <button class="btn" id="runSyncBtn">Синхронизировать сейчас</button>
+      </div>
+      <p class="note">Контакты подтягиваются из 1C автоматически каждую минуту — по одному запросу на каждый регион, у которого задана <b>Область (1C)</b>. Телефон сохраняется в виде 9-значного номера (напр. <code>909090774</code>): <code>+998</code>, пробелы и дефисы отбрасываются. Ручная загрузка Excel больше не нужна.</p>
+      <div id="syncSummary" class="msg" style="display:none"></div>
+      <div id="syncTableWrap"></div>
+    </section>
+
+    <!-- CONTACTS -->
+    <section class="panel" id="panel-contacts">
+      <div class="toolbar">
+        <h2 style="margin:0;margin-right:auto">Контакты по региону</h2>
+        <select id="contactsRegion"></select>
+        <button class="btn small ghost" id="loadContactsBtn">Показать</button>
+      </div>
+      <div id="contactsTableWrap"></div>
+    </section>
+  </main>
+
+  <!-- Region modal -->
+  <div class="modal-bg" id="regionModal">
+    <div class="modal">
+      <h3 id="regionModalTitle">Новый регион</h3>
+      <input type="hidden" id="regionId" />
+      <div class="grid">
+        <label class="fld">Название региона *<input class="f" id="rName" placeholder="Самарканд" /></label>
+        <label class="fld">Транк / DID (CallerID)<input class="f" id="rTrunk" placeholder="557056666" /></label>
+        <label class="fld">Outbound-префикс<input class="f" id="rPrefix" placeholder="71" /></label>
+        <label class="fld">Очередь (queue)<input class="f" id="rQueue" placeholder="1111" /></label>
+        <label class="fld">Агенты (extensions)<input class="f" id="rAgents" placeholder="101-125" /></label>
+        <label class="fld">Входящий DID<input class="f" id="rInbound" placeholder="557041122" /></label>
+        <label class="fld">Вх. назначение (очередь / ринг-группа)<input class="f" id="rInboundTarget" placeholder="6001" /></label>
+        <label class="fld">IVR для неизвестных (context,exten,priority)<input class="f" id="rInboundIvr" placeholder="ivr-1,s,1" /></label>
+        <label class="fld">Область (1C) — источник контактов<select id="rOblast1c"></select></label>
+      </div>
+      <p class="note" style="margin-top:0"><b>Известный</b> звонящий уходит по своему номеру во «Вх. назначение» (очередь/ринг-группа, где сидят агенты). <b>Неизвестный</b> — в этот <b>IVR</b>, выбранный по DID, на который он позвонил (у каждого транка свой IVR). Если IVR пуст — используется общий DEFAULT_TARGET из .env.</p>
+      <p class="note" style="margin-top:0"><b>Область (1C)</b> — из этого справочника (поле «Область» в 1C) контакты этого региона подтягиваются автоматически каждую минуту. Если не выбрано — регион не синхронизируется.</p>
+      <div class="msg" id="regionMsg"></div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="regionCancel">Отмена</button>
+        <button class="btn" id="regionSave">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="admin.js"></script>
+</body>
+</html>

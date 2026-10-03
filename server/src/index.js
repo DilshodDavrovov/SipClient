@@ -15,6 +15,7 @@ const AmiClient = require('./ami-client');
 const CallStore = require('./call-store');
 const CallFlowClient = require('./callflow-client');
 const { Db } = require('./db');
+const regions = require('./regions');
 
 const {
   AMI_HOST,
@@ -25,6 +26,13 @@ const {
   AMI_ORIGINATE_PRIORITY = '1',
   AMI_CHANNEL_TECH = 'SIP',
   TRACK_EXTENSIONS = '',
+  STAGING_QUEUE = '',
+  REDIRECT_CONTEXT = 'from-internal',
+  DEFAULT_TARGET = '',
+  ONEC_URL = '',
+  ONEC_LOGIN = '',
+  ONEC_PASSWORD = '',
+  SYNC_INTERVAL_MS = '60000',
   HTTP_PORT = '3001',
   API_TOKEN,
   FRONTEND_ORIGIN = '*',
@@ -61,6 +69,17 @@ const callStore = new CallStore({ channelTech: AMI_CHANNEL_TECH, trackExtensions
 
 const ami = new AmiClient({ host: AMI_HOST, port: Number(AMI_PORT), username: AMI_USERNAME, secret: AMI_SECRET });
 callStore.attach(ami);
+
+// SSH-free inbound region routing: watch a neutral staging queue and, over
+// AMI, redirect each caller to their region's queue/ring group by caller
+// number. No dialplan/AGI needed — see region-inbound-ami.js for setup.
+require('./region-inbound-ami').initRegionInboundAmi({
+  ami,
+  db,
+  stagingQueues: STAGING_QUEUE.split(',').map((s) => s.trim()).filter(Boolean),
+  redirectContext: REDIRECT_CONTEXT,
+  defaultTarget: DEFAULT_TARGET,
+});
 
 // Diagnostics while we bring up click-to-call — logs only events touching a
 // tracked extension's own channel (never the whole PBX's traffic, which
@@ -108,7 +127,7 @@ if (CALLFLOW_BASE_URL && CALLFLOW_USERNAME && CALLFLOW_PASSWORD) {
 
 const app = express();
 app.use(cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN.split(',').map((s) => s.trim()) }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 function requireApiKey(req, res, next) {
   // Query-param fallback exists so a plain <audio src="...?key=..."> tag can
@@ -246,6 +265,12 @@ app.post('/api/call', requireApiKey, async (req, res) => {
     return res.status(503).json({ error: 'AMI not connected' });
   }
 
+  // Region routing: if this number belongs to a region with an outbound
+  // prefix, dial the prefixed target so FreePBX's per-region outbound route
+  // picks that region's trunk. Unknown numbers dial through unchanged. The
+  // call log still stores the real number (toNumber: to), not the prefix.
+  const { dialTarget, region } = regions.resolveOutbound(db.db, to);
+
   const actionId = 'c2c-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
   callStore.registerOrigination(actionId, { operatorExtension: from, toNumber: to });
 
@@ -253,12 +278,13 @@ app.post('/api/call', requireApiKey, async (req, res) => {
     const ack = await ami.sendWithActionId('Originate', actionId, {
       Channel: `${AMI_CHANNEL_TECH}/${from}`,
       Context: AMI_ORIGINATE_CONTEXT,
-      Exten: to,
+      Exten: dialTarget,
       Priority: AMI_ORIGINATE_PRIORITY,
       Async: 'true',
       Timeout: 30000,
       CallerID: `CRM Click2Call <${from}>`,
     });
+    if (region) console.log(`[ami:originate region] "${region.name}" trunk=${region.trunkDid || '?'} ${to} -> ${dialTarget}`);
     console.log('[ami:originate ack]', JSON.stringify(ack));
     if (ack.Response !== 'Success') {
       return res.status(502).json({ error: ack.Message || 'Originate rejected by Asterisk' });
@@ -637,6 +663,41 @@ app.post('/api/callbacks', requireApiKey, (req, res) => {
 app.delete('/api/callbacks/:id', requireApiKey, (req, res) => {
   db.deleteCallback(req.params.id);
   res.json({ ok: true });
+});
+
+/* ------------------------------------------------------------------ */
+/* Regions (admin panel: region CRUD, contact import, region routing)   */
+/* ------------------------------------------------------------------ */
+
+regions.mountRegions(app, { db, requireApiKey });
+
+/* ------------------------------------------------------------------ */
+/* Reports for 1C: operator analytics + per-call client info — see      */
+/* reports.js. Was left unmounted when the file landed, so both routes  */
+/* answered 404 on prod.                                                */
+/* ------------------------------------------------------------------ */
+const { mountReports } = require('./reports');
+mountReports(app, { db, requireApiKey });
+
+/* ------------------------------------------------------------------ */
+/* 1C contact sync — polls the 1C service per region every minute and   */
+/* upserts counterparties (replaces the manual Excel upload).           */
+/* ------------------------------------------------------------------ */
+const { initContactsSync } = require('./contacts-sync-1c');
+const contactsSync = initContactsSync({
+  db,
+  url: ONEC_URL,
+  login: ONEC_LOGIN,
+  password: ONEC_PASSWORD,
+  intervalMs: Number(SYNC_INTERVAL_MS) || 60000,
+});
+contactsSync.start();
+
+// Sync status for the admin panel, and a manual "sync now" trigger.
+app.get('/api/sync/status', requireApiKey, (req, res) => res.json(contactsSync.getStatus()));
+app.post('/api/sync/run', requireApiKey, async (req, res) => {
+  const status = await contactsSync.syncNow();
+  res.json(status);
 });
 
 /* ------------------------------------------------------------------ */
