@@ -1189,7 +1189,8 @@ function refreshNotes() {
     return;
   }
   const cfg = loadConfig();
-  amiFetch(cfg, '/api/notes')
+  // Only this operator's own notes — the server filters by ?extension=.
+  amiFetch(cfg, '/api/notes?extension=' + encodeURIComponent(cfg.operatorExt))
     .then((data) => {
       notes = data.notes || [];
       updateNoteBadge();
@@ -1268,7 +1269,9 @@ function saveNoteFromModal() {
 
   const cfg = loadConfig();
   const isEdit = !!noteModalEditId;
-  const path = isEdit ? `/api/notes/${encodeURIComponent(noteModalEditId)}` : '/api/notes';
+  const path = isEdit
+    ? `/api/notes/${encodeURIComponent(noteModalEditId)}?extension=${encodeURIComponent(cfg.operatorExt)}`
+    : '/api/notes';
   const body = isEdit
     ? { text }
     : {
@@ -1338,7 +1341,7 @@ el.notesBody.addEventListener('click', (e) => {
   const removeBtn = e.target.closest('.note-remove-btn');
   if (removeBtn && notesBackendReady()) {
     const cfg = loadConfig();
-    amiFetch(cfg, `/api/notes/${encodeURIComponent(removeBtn.dataset.id)}`, { method: 'DELETE' })
+    amiFetch(cfg, `/api/notes/${encodeURIComponent(removeBtn.dataset.id)}?extension=${encodeURIComponent(cfg.operatorExt)}`, { method: 'DELETE' })
       .then(refreshNotes)
       .catch((err) => showToast('Не удалось удалить: ' + err.message, { error: true }));
   }

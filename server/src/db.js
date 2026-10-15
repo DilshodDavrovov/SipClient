@@ -815,7 +815,7 @@ class Db {
         (SELECT COUNT(*) FROM bookings b WHERE b.call_id = c.id) AS booking_count,
         (SELECT amount FROM bookings b WHERE b.call_id = c.id) AS booking_amount,
         (SELECT info FROM bookings b WHERE b.call_id = c.id) AS booking_info,
-        (SELECT COUNT(*) FROM notes n WHERE n.call_id = c.id) AS note_count
+        (SELECT COUNT(*) FROM notes n WHERE n.call_id = c.id AND n.operator_extension = c.operator_extension) AS note_count
       FROM calls c ${join}
       ${where}
       GROUP BY c.id
@@ -867,9 +867,19 @@ class Db {
     this.stmts.deleteNote.run(id);
   }
 
-  listNotes({ contactId, limit = 500, offset = 0 } = {}) {
-    const where = contactId ? 'WHERE contact_id = ?' : '';
-    const params = contactId ? [contactId] : [];
+  getNote(id) {
+    const row = this.db.prepare('SELECT * FROM notes WHERE id = ?').get(id);
+    return row ? noteRowToJson(row) : null;
+  }
+
+  // operatorExtension: only that operator's notes (notes are private, see
+  // GET /api/notes). Omitted = no owner filter (internal use only).
+  listNotes({ contactId, operatorExtension, limit = 500, offset = 0 } = {}) {
+    const clauses = [];
+    const params = [];
+    if (contactId) { clauses.push('contact_id = ?'); params.push(contactId); }
+    if (operatorExtension) { clauses.push('operator_extension = ?'); params.push(operatorExtension); }
+    const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : '';
     const rows = this.db.prepare(`
       SELECT * FROM notes ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?
     `).all(...params, limit, offset);

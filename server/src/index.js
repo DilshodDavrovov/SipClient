@@ -644,13 +644,32 @@ app.delete('/api/contacts/:id', requireApiKey, (req, res) => {
 /* Notes                                                                */
 /* ------------------------------------------------------------------ */
 
+// Notes are private: every operator sees, edits and deletes only their own
+// (notes.operator_extension = the caller's ?extension=). Without an
+// extension nothing is listed — there is no "all operators" view.
+function noteOwner(req) {
+  return String(req.query.extension || (req.body && req.body.operatorExtension) || '').trim();
+}
+
+// 404 (not 403) for someone else's note: its existence is not revealed.
+function requireOwnNote(req, res) {
+  const owner = noteOwner(req);
+  const note = db.getNote(req.params.id);
+  if (!owner) { res.status(400).json({ error: '"extension" query param is required' }); return null; }
+  if (!note || note.operatorExtension !== owner) { res.status(404).json({ error: 'note not found' }); return null; }
+  return note;
+}
+
 app.get('/api/notes', requireApiKey, (req, res) => {
-  res.json({ notes: db.listNotes({ contactId: req.query.contactId }) });
+  const owner = noteOwner(req);
+  if (!owner) return res.status(400).json({ error: '"extension" query param is required' });
+  res.json({ notes: db.listNotes({ contactId: req.query.contactId, operatorExtension: owner }) });
 });
 
 app.post('/api/notes', requireApiKey, (req, res) => {
   const { text, number } = req.body || {};
   if (!text || !String(text).trim()) return res.status(400).json({ error: '"text" is required' });
+  if (!noteOwner(req)) return res.status(400).json({ error: '"operatorExtension" is required — a note must have an owner' });
   const id = 'note-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
   res.status(201).json(db.createNote({
     id,
@@ -658,17 +677,19 @@ app.post('/api/notes', requireApiKey, (req, res) => {
     number,
     name: req.body.name,
     text,
-    operatorExtension: req.body.operatorExtension,
+    operatorExtension: noteOwner(req),
   }));
 });
 
 app.put('/api/notes/:id', requireApiKey, (req, res) => {
   const { text } = req.body || {};
   if (!text || !String(text).trim()) return res.status(400).json({ error: '"text" is required' });
+  if (!requireOwnNote(req, res)) return;
   res.json(db.updateNote(req.params.id, text));
 });
 
 app.delete('/api/notes/:id', requireApiKey, (req, res) => {
+  if (!requireOwnNote(req, res)) return;
   db.deleteNote(req.params.id);
   res.json({ ok: true });
 });
