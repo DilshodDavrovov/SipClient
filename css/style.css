@@ -115,6 +115,13 @@ body {
 .stat-tile.stat-critical { border-left-color: var(--red); }
 .stat-tile.stat-neutral { border-left-color: var(--teal); }
 .stat-tile.stat-booking { border-left-color: var(--yellow); }
+/* Sales tile: day and month side by side (flex, not grid — old WebKit). */
+.stat-split { display: flex; flex: 1 1 auto; min-width: 0; }
+.stat-half { flex: 1 1 0; min-width: 0; }
+.stat-half + .stat-half { margin-left: 12px; padding-left: 12px; border-left: 1px solid var(--border); }
+.stat-half .stat-value { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat-count { color: var(--text-dim); }
+.stat-tile.stat-stale .stat-value { opacity: 0.55; }
 .stat-tile > * + * { margin-left: 12px; }
 
 .stats-bar-actions {

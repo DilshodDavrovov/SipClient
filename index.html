@@ -6,7 +6,7 @@
 <title>SIP Оператор</title>
 <!-- ?v= — против кэша встроенного WebKit 1С: при изменении css/js меняйте
      номер версии здесь, иначе 1С может продолжать грузить старый файл. -->
-<link rel="stylesheet" href="css/style.css?v=20261015" />
+<link rel="stylesheet" href="css/style.css?v=20261016" />
 </head>
 <body>
 
@@ -153,11 +153,20 @@
           <div class="stat-label">Пропущенные</div>
         </div>
       </div>
-      <div class="stat-tile stat-booking">
+      <div class="stat-tile stat-booking" id="statSalesTile">
         <span class="stat-icon"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/></svg></span>
-        <div class="stat-body">
-          <div class="stat-value" id="statBookings">0</div>
-          <div class="stat-label">Брони</div>
+        <!-- Продажи оператора из 1С (строки РеализацияТоваров.Товары по полю
+             "Оператор") — см. refreshSalesStats() в app.js и
+             server/src/operator-sales-1c.js. -->
+        <div class="stat-body stat-split" title="Продажи по строкам документов «Реализация товаров», где вы указаны оператором">
+          <div class="stat-half">
+            <div class="stat-value" id="statSalesDay">0</div>
+            <div class="stat-label">За день <span id="statSalesDayCount" class="stat-count"></span></div>
+          </div>
+          <div class="stat-half">
+            <div class="stat-value" id="statSalesMonth">0</div>
+            <div class="stat-label">За месяц <span id="statSalesMonthCount" class="stat-count"></span></div>
+          </div>
         </div>
       </div>
       <div class="stat-tile stat-neutral">
@@ -562,6 +571,6 @@
 <audio id="remoteAudio" autoplay></audio>
 
 <script src="vendor/jssip.bundle.min.js"></script>
-<script src="js/app.js?v=20261015"></script>
+<script src="js/app.js?v=20261016"></script>
 </body>
 </html>

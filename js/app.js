@@ -137,7 +137,11 @@ const el = {
 
   statHandled: document.getElementById('statHandled'),
   statMissed: document.getElementById('statMissed'),
-  statBookings: document.getElementById('statBookings'),
+  statSalesTile: document.getElementById('statSalesTile'),
+  statSalesDay: document.getElementById('statSalesDay'),
+  statSalesDayCount: document.getElementById('statSalesDayCount'),
+  statSalesMonth: document.getElementById('statSalesMonth'),
+  statSalesMonthCount: document.getElementById('statSalesMonthCount'),
   statDuration: document.getElementById('statDuration'),
 
   outcomeModal: document.getElementById('outcomeModal'),
@@ -451,38 +455,58 @@ function renderStats(list) {
   el.statHandled.textContent = handled;
   el.statMissed.textContent = missed;
   el.statDuration.textContent = formatDuration(totalDuration);
-  // "Брони" is intentionally NOT derived from this list's outcome tags —
-  // an operator clicking "Открыть бронирование" is only ever local intent,
-  // not proof a booking (and its amount) actually exists. See
-  // refreshBookingStats(), backed by POST /api/call/:id/booking.
+  // Sales are NOT derived from this list's outcome tags — an operator
+  // clicking "Открыть бронирование" is only local intent. The sales tile
+  // comes straight from 1C, see refreshSalesStats().
 }
 
 function formatMoney(amount) {
   return Math.round(amount).toLocaleString('ru-RU');
 }
 
-// Only counts bookings CONFIRMED via the API (see POST /api/call/:id/booking
-// in server/src/index.js) — that's an external system reporting back after
-// the operator actually created the booking there, not anything this app
-// can know on its own. Polled periodically (see the setInterval below)
-// since there's no push notification path for "a booking just got
-// confirmed" the way there is for live call state.
-function refreshBookingStats() {
+// "За день" / "За месяц" sales tile. The numbers come from 1C itself: the
+// backend reads the rows of РеализацияТоваров.Товары where this operator is
+// set in the "Оператор" column (one booking can be split between several
+// operators) — see server/src/operator-sales-1c.js. The backend re-reads
+// 1C every minute and shortly after each finished call, and pushes a WS
+// "sales" message when the numbers change; this function only reads the
+// backend's cached result, so calling it often is cheap.
+function salesCountLabel(n) {
+  const mod10 = n % 10, mod100 = n % 100;
+  const word = mod10 === 1 && mod100 !== 11 ? 'бронь'
+    : mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? 'брони' : 'броней';
+  return `· ${n} ${word}`;
+}
+
+function renderSalesStats(data) {
+  const day = (data && data.day) || { amount: 0, count: 0 };
+  const month = (data && data.month) || { amount: 0, count: 0 };
+  el.statSalesDay.textContent = formatMoney(day.amount || 0);
+  el.statSalesDayCount.textContent = salesCountLabel(day.count || 0);
+  el.statSalesMonth.textContent = formatMoney(month.amount || 0);
+  el.statSalesMonthCount.textContent = salesCountLabel(month.count || 0);
+  // Dim the numbers when 1C could not be reached on the last attempt (they
+  // are then the last known values, not current ones).
+  const stale = !!(data && data.error);
+  el.statSalesTile.classList.toggle('stat-stale', stale);
+  el.statSalesTile.title = stale
+    ? 'Нет связи с 1С, показаны последние полученные данные: ' + data.error
+    : 'Продажи по строкам документов «Реализация товаров», где вы указаны оператором'
+      + (data && data.updatedAt ? '. Обновлено ' + new Date(data.updatedAt).toLocaleTimeString('ru-RU') : '');
+}
+
+function refreshSalesStats() {
   if (!historyBackendReady()) {
-    el.statBookings.textContent = '0';
+    renderSalesStats(null);
     return;
   }
   const cfg = loadConfig();
-  amiFetch(cfg, '/api/bookings/stats?extension=' + encodeURIComponent(cfg.operatorExt))
-    .then((data) => {
-      const count = data.count || 0;
-      const sum = data.totalAmount || 0;
-      el.statBookings.textContent = sum ? `${count} · ${formatMoney(sum)}` : String(count);
-    })
-    .catch((err) => logDebug('refreshBookingStats failed: ' + err.message));
+  amiFetch(cfg, '/api/sales/stats?extension=' + encodeURIComponent(cfg.operatorExt))
+    .then(renderSalesStats)
+    .catch((err) => logDebug('refreshSalesStats failed: ' + err.message));
 }
 
-setInterval(() => { if (historyBackendReady()) refreshBookingStats(); }, 60000);
+setInterval(() => { if (historyBackendReady()) refreshSalesStats(); }, 60000);
 
 let historySearchQuery = '';
 let currentHistoryTab = 'history';
@@ -2164,7 +2188,7 @@ function handleAmiMessage(msg, cfg) {
       if (currentHistoryTab === 'history') loadHistoryPage(false);
       refreshNotes();
       refreshCallbacks();
-      refreshBookingStats();
+      refreshSalesStats();
       if (currentHistoryTab === 'contacts') loadContacts(false);
 
       if (currentMode !== 'ami') break;
@@ -2214,13 +2238,15 @@ function handleAmiMessage(msg, cfg) {
       break;
     }
     // Pushed by the server the moment an external system confirms a
-    // booking (POST /api/call/:id/booking) — nothing about that flows
-    // through the normal AMI event path, so without this the "Брони" tile
-    // and the history tag would just sit stale until the next 60s poll.
+    // booking (POST /api/call/:id/booking) — refreshes the history tag.
     case 'booking': {
       if (msg.operatorExtension !== cfg.operatorExt) break;
-      refreshBookingStats();
       debouncedHistoryRefresh();
+      break;
+    }
+    // The backend re-read operator sales from 1C and something changed.
+    case 'sales': {
+      refreshSalesStats();
       break;
     }
   }
@@ -2343,6 +2369,9 @@ function maybePromptOutcomeOnAnswer(record) {
 }
 
 function finalizeAmiRecord(record) {
+  // Call over: the backend re-reads sales from 1C shortly and pushes a
+  // "sales" message; read the current cache right away as well.
+  if (amiRt.activeRecordId === record.id) refreshSalesStats();
   stopRingtone();
   stopCallTimer();
   hideIncomingCall();
@@ -2970,7 +2999,7 @@ el.cfgDisconnectBtn.addEventListener('click', () => {
 
 function init() {
   refreshStatsAndHistory();
-  refreshBookingStats();
+  refreshSalesStats();
   updateCallButtonEnabled();
   refreshKeypadVisibility();
   updateCallbackBadge();

@@ -246,4 +246,4 @@ function initContactsSync({ db, url, exchangeHeader = '', login = '', password =
   return { start, stop, syncNow, getStatus };
 }
 
-module.exports = { initContactsSync, clean9, collectPhones };
+module.exports = { initContactsSync, clean9, collectPhones, delatinizeUrl };

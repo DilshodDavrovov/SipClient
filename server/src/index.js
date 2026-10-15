@@ -33,6 +33,8 @@ const {
   ONEC_LOGIN = '',
   ONEC_PASSWORD = '',
   SYNC_INTERVAL_MS = '60000',
+  ONEC_SALES_URL = '',
+  SALES_SYNC_INTERVAL_MS = '60000',
   HTTP_PORT = '3001',
   API_TOKEN,
   FRONTEND_ORIGIN = '*',
@@ -728,6 +730,28 @@ const contactsSync = initContactsSync({
 });
 contactsSync.start();
 
+/* ------------------------------------------------------------------ */
+/* Operator sales from 1C ("Продажи за день/месяц" tiles) — see         */
+/* operator-sales-1c.js. Polled every SALES_SYNC_INTERVAL_MS and right  */
+/* after calls end; browsers get a WS "sales" push when numbers change. */
+/* ------------------------------------------------------------------ */
+const { initOperatorSales, resolveSalesUrl } = require('./operator-sales-1c');
+const operatorSales = initOperatorSales({
+  url: resolveSalesUrl(ONEC_SALES_URL, ONEC_URL),
+  login: ONEC_LOGIN,
+  password: ONEC_PASSWORD,
+  intervalMs: Number(SALES_SYNC_INTERVAL_MS) || 60000,
+  onChange: () => broadcast({ type: 'sales' }),
+});
+operatorSales.start();
+
+app.get('/api/sales/stats', requireApiKey, (req, res) => {
+  if (!req.query.extension) return res.status(400).json({ error: '"extension" query param is required' });
+  res.json(operatorSales.statsFor(req.query.extension));
+});
+app.get('/api/sales/status', requireApiKey, (req, res) => res.json(operatorSales.getStatus()));
+app.post('/api/sales/refresh', requireApiKey, async (req, res) => res.json(await operatorSales.refresh('manual')));
+
 // Sync status for the admin panel, and a manual "sync now" trigger.
 app.get('/api/sync/status', requireApiKey, (req, res) => res.json(contactsSync.getStatus()));
 app.post('/api/sync/run', requireApiKey, async (req, res) => {
@@ -761,7 +785,12 @@ function broadcast(payload) {
   }
 }
 
-callStore.on('update', (record) => broadcast({ type: 'update', record }));
+callStore.on('update', (record) => {
+  broadcast({ type: 'update', record });
+  // A finished conversation is when a booking typically gets saved in 1C —
+  // re-read the sales soon after (debounced inside operatorSales).
+  if (record.endedAt && record.answeredAt) operatorSales.refreshSoon();
+});
 callStore.on('incoming', (record) => broadcast({ type: 'incoming', record }));
 ami.on('connected', () => broadcast({ type: 'ami_status', amiConnected: true }));
 ami.on('disconnected', () => broadcast({ type: 'ami_status', amiConnected: false }));
