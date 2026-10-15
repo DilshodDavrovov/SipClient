@@ -3,6 +3,10 @@
 const EventEmitter = require('events');
 
 const MAX_IN_MEMORY = 300;
+// An "in progress" record older than this is treated as stale for memory
+// eviction purposes (no real call lasts this long; see _pruneMemory).
+const STALE_ACTIVE_MS = 12 * 60 * 60 * 1000;
+const MAX_EXTEN_CACHE = 2000;
 
 /**
  * Turns raw AMI events into a list of "calls" for the operator UI, and keeps
@@ -109,7 +113,7 @@ class CallStore extends EventEmitter {
   // name, since a record reloaded from SQLite after a restart never had
   // channel names persisted (see db.js rowToRecord) — only call
   // correlation ids survive that round-trip.
-  reconcileWithAsterisk(liveChannelEvents) {
+  reconcileWithAsterisk(liveChannelEvents, snapshotAt = Date.now()) {
     const liveLinkedids = new Set();
     const liveUniqueids = new Set();
     for (const evt of liveChannelEvents) {
@@ -117,17 +121,28 @@ class CallStore extends EventEmitter {
       if (evt.Uniqueid) liveUniqueids.add(evt.Uniqueid);
     }
 
+    // A call that began around the moment the channel list was taken may
+    // simply not be in it yet — never treat those as gone.
+    const tooFresh = (r) => (r.startedAt || 0) > snapshotAt - 10000;
+    const isLive = (r) => tooFresh(r) || (r.linkedid && liveLinkedids.has(r.linkedid)) || liveUniqueids.has(r.id);
+
     let finalized = 0;
     for (const record of this.records.values()) {
-      if (record.endedAt) continue;
-      const stillLive = (record.linkedid && liveLinkedids.has(record.linkedid)) || liveUniqueids.has(record.id);
-      if (stillLive) continue;
+      if (record.endedAt || isLive(record)) continue;
+      if (this.finalizeMissing(record)) finalized++;
+    }
 
-      record.state = record.state === 'answered' ? 'ended' : 'failed';
-      record.disposition = record.disposition || 'RECONCILED';
-      record.endedAt = Date.now();
-      this._emitUpdate(record);
-      finalized++;
+    // Rows that are unfinished in the DB but no longer in memory (evicted
+    // before the fix in _pruneMemory, or orphaned by a restart). They ended
+    // at an unknown time — close them at their last known moment so the
+    // history doesn't show multi-day "conversations".
+    if (this.db) {
+      let stale = [];
+      try { stale = this.db.listUnfinishedCalls(); } catch (err) { stale = []; }
+      for (const record of stale) {
+        if (this.records.has(record.id) || isLive(record)) continue;
+        if (this.finalizeMissing(record, record.answeredAt || record.startedAt)) finalized++;
+      }
     }
     return finalized;
   }
@@ -607,9 +622,13 @@ class CallStore extends EventEmitter {
   }
 
   _onHangup(evt) {
+    this.lastExtenByChannel.delete(evt.Channel);
     const recordId = this.byUniqueid.get(evt.Uniqueid);
-    if (!recordId) return;
-    const record = this.records.get(recordId);
+    // Safety net for a record that is no longer in memory (evicted, or the
+    // backend restarted mid-call): the call's own Uniqueid is its record id,
+    // so reload it from the DB and finalize it there instead of silently
+    // dropping the Hangup and leaving the call "active" forever.
+    const record = (recordId && this.records.get(recordId)) || this._reviveFromDb(recordId || evt.Uniqueid);
     if (!record || record.endedAt) return; // already finalized by a DialEnd/other leg
 
     record.endedAt = Date.now();
@@ -638,7 +657,6 @@ class CallStore extends EventEmitter {
       record.state = 'failed';
       record.disposition = record.disposition || evt['Cause-txt'] || 'NOANSWER';
     }
-    this.lastExtenByChannel.delete(evt.Channel);
     this._emitUpdate(record);
   }
 
@@ -684,11 +702,44 @@ class CallStore extends EventEmitter {
     return record;
   }
 
+  // Evicts the oldest FINISHED calls once over MAX_IN_MEMORY. A call that is
+  // still in progress is never evicted: with every extension tracked, a busy
+  // hour creates 300-450 records (each ring-group leg is its own record), so
+  // the old "drop the oldest, whatever its state" rule threw out any
+  // conversation longer than ~40 minutes while it was still going. Its
+  // Hangup then found no record and was ignored — the call stayed "В
+  // разговоре" in the UI and in the DB forever, and "Завершить" answered
+  // "call not found". Unfinished records only go once they are absurdly old
+  // (STALE_ACTIVE_MS), as a last-resort bound on memory; the periodic
+  // reconcile in index.js closes those properly long before that.
   _pruneMemory() {
     if (this.records.size <= MAX_IN_MEMORY) return;
-    const sorted = [...this.records.values()].sort((a, b) => a.startedAt - b.startedAt);
-    for (let i = 0; i < sorted.length - MAX_IN_MEMORY; i++) {
-      this.records.delete(sorted[i].id);
+    const now = Date.now();
+    const evictable = [...this.records.values()]
+      .filter((r) => r.endedAt || now - r.startedAt > STALE_ACTIVE_MS)
+      .sort((a, b) => a.startedAt - b.startedAt);
+    const excess = this.records.size - MAX_IN_MEMORY;
+    if (excess <= 0 || !evictable.length) return;
+    const removed = new Set();
+    for (let i = 0; i < evictable.length && i < excess; i++) {
+      this.records.delete(evictable[i].id);
+      removed.add(evictable[i].id);
+    }
+    // byUniqueid used to be append-only (a slow memory leak: ~680 MB after a
+    // few days on prod). Entries pointing at evicted records are useless —
+    // _onHangup falls back to the DB by the Uniqueid itself (see there).
+    for (const [uid, recordId] of this.byUniqueid) {
+      if (removed.has(recordId)) this.byUniqueid.delete(uid);
+    }
+    // Last dialplan step per channel: only needed while that channel is
+    // alive; Hangup deletes it, this caps anything a missed Hangup left.
+    if (this.lastExtenByChannel.size > MAX_EXTEN_CACHE) {
+      const drop = this.lastExtenByChannel.size - MAX_EXTEN_CACHE;
+      let i = 0;
+      for (const key of this.lastExtenByChannel.keys()) {
+        if (i++ >= drop) break;
+        this.lastExtenByChannel.delete(key);
+      }
     }
   }
 
@@ -716,6 +767,32 @@ class CallStore extends EventEmitter {
       }
     }
     this.emit('update', record);
+  }
+
+  // Brings an unfinished call back from SQLite into the live store (channels
+  // unknown — they were never persisted). Returns null for unknown or
+  // already-finished calls.
+  _reviveFromDb(id) {
+    if (!this.db || !id) return null;
+    let record = null;
+    try { record = this.db.getCallRow(id); } catch (err) { return null; }
+    if (!record || record.endedAt || !record.startedAt) return null;
+    this.records.set(record.id, record);
+    this.byUniqueid.set(record.id, record.id);
+    return record;
+  }
+
+  // Marks a call as over without a Hangup event (it was missed, or the call
+  // had already vanished from Asterisk). `endedAt` defaults to now; callers
+  // closing long-dead DB rows pass their own so the duration isn't inflated
+  // by days. RECONCILED disposition keeps these out of talk-time stats.
+  finalizeMissing(record, endedAt = Date.now()) {
+    if (!record || record.endedAt) return false;
+    record.state = record.state === 'answered' ? 'ended' : 'failed';
+    record.disposition = record.disposition || 'RECONCILED';
+    record.endedAt = Math.max(endedAt, record.answeredAt || 0, record.startedAt || 0);
+    this._emitUpdate(record);
+    return true;
   }
 
   _preloadFromDb() {

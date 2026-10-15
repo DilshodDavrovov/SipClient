@@ -743,6 +743,11 @@ class Db {
     return rowToRecord(this.stmts.getCall.get(id));
   }
 
+  // Calls never marked as ended — input for CallStore.reconcileWithAsterisk.
+  listUnfinishedCalls() {
+    return this.db.prepare('SELECT * FROM calls WHERE ended_at IS NULL AND started_at IS NOT NULL').all().map(rowToRecord);
+  }
+
   listRecentRaw(limit) {
     const rows = this.db.prepare('SELECT * FROM calls ORDER BY started_at DESC LIMIT ?').all(limit);
     return rows.map(rowToRecord);

@@ -103,13 +103,24 @@ ami.on('connected', () => {
   console.log('[ami] login OK, watching extensions:', trackAll ? 'all internal extensions (auto)' : trackExtensions.join(', '));
   // Every (re)connect is exactly when a call could have hung up while we
   // weren't listening — reconcile before anything else touches call state.
+  reconcileNow('after (re)connect');
+});
+
+// Closes calls whose Hangup was missed, by comparing against Asterisk's live
+// channel list. Runs on every AMI (re)connect and then periodically — a lost
+// event otherwise leaves a call "В разговоре" in the UI until someone
+// restarts the backend.
+function reconcileNow(reason) {
+  if (!amiConnected) return;
+  const snapshotAt = Date.now();
   ami.listActiveChannels()
     .then((channels) => {
-      const n = callStore.reconcileWithAsterisk(channels);
-      if (n) console.log(`[ami] reconciled ${n} call(s) that had ended while disconnected`);
+      const n = callStore.reconcileWithAsterisk(channels, snapshotAt);
+      if (n) console.log(`[ami] reconciled ${n} call(s) no longer live on Asterisk (${reason})`);
     })
     .catch((err) => console.error('[ami] reconcile failed:', err.message));
-});
+}
+setInterval(() => reconcileNow('periodic'), 2 * 60 * 1000);
 ami.on('disconnected', () => { amiConnected = false; console.warn('[ami] disconnected, will retry'); });
 ami.on('error', (err) => console.error('[ami] error:', err.message));
 ami.connect();
@@ -295,14 +306,38 @@ app.post('/api/call', requireApiKey, async (req, res) => {
   }
 });
 
+// "Завершить". Must never leave the operator stuck: if the call is no longer
+// in memory (or its channel names are unknown — e.g. reloaded from SQLite),
+// ask Asterisk which channels of this call are still alive and hang those
+// up; if none are, the call is already over — close the record and say so
+// (`alreadyEnded`), and the UI resets itself (see hangupAmiCall in app.js).
 app.post('/api/call/:id/hangup', requireApiKey, async (req, res) => {
-  const record = callStore.get(req.params.id) || callStore.findByActionId(req.params.id);
-  if (!record) return res.status(404).json({ error: 'call not found (or not established yet)' });
-  const channel = callStore.resolveRemoteChannel(record);
-  if (!channel) return res.status(409).json({ error: 'no channel to hang up yet, try again shortly' });
+  const id = req.params.id;
+  const record = callStore.get(id) || callStore.findByActionId(id) || callStore._reviveFromDb(id) || db.getCallRow(id);
+  if (!record) return res.status(404).json({ error: 'call not found (or not established yet)', alreadyEnded: true });
+  if (record.endedAt) return res.json({ ok: true, alreadyEnded: true });
 
   try {
+    let channel = callStore.resolveRemoteChannel(record);
+    if (!channel && amiConnected) {
+      const live = await ami.listActiveChannels();
+      const legs = live.filter((c) => c.Uniqueid === record.id || (record.linkedid && c.Linkedid === record.linkedid));
+      if (!legs.length) {
+        callStore.finalizeMissing(record);
+        return res.json({ ok: true, alreadyEnded: true });
+      }
+      // Prefer the operator's own leg — hanging it up ends the whole call.
+      const own = new RegExp(`^${AMI_CHANNEL_TECH}/${record.operatorExtension}-`, 'i');
+      channel = (legs.find((c) => own.test(c.Channel)) || legs[0]).Channel;
+    }
+    if (!channel) return res.status(409).json({ error: 'no channel to hang up yet, try again shortly' });
+
     const ack = await ami.send('Hangup', { Channel: channel });
+    if (ack.Response !== 'Success' && /no such channel/i.test(ack.Message || '')) {
+      // The channel is already gone — the Hangup event was missed.
+      callStore.finalizeMissing(record);
+      return res.json({ ok: true, alreadyEnded: true });
+    }
     res.json({ ok: ack.Response === 'Success', message: ack.Message });
   } catch (err) {
     res.status(502).json({ error: err.message });

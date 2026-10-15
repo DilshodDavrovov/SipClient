@@ -2395,13 +2395,40 @@ function placeCallAmi(cfg) {
 function hangupAmiCall(cfg) {
   const id = amiRt.activeRecordId || amiRt.pendingActionId;
   logDebug('hangupAmiCall: click received, id=' + id);
-  if (!id) { logDebug('hangupAmiCall: no active call id, nothing to hang up'); return; }
+  if (!id) {
+    // Panel is showing but there is no call behind it — just close it.
+    logDebug('hangupAmiCall: no active call id, resetting the call panel');
+    resetAmiCallUi(null);
+    return;
+  }
   amiFetch(cfg, `/api/call/${encodeURIComponent(id)}/hangup`, { method: 'POST' })
-    .then(() => logDebug('hangupAmiCall: OK'))
+    .then((data) => {
+      logDebug('hangupAmiCall: OK' + (data && data.alreadyEnded ? ' (call had already ended)' : ''));
+      // The server found the call already over (its Hangup event was
+      // missed) — no 'update' will ever arrive for it, so reset here.
+      if (data && data.alreadyEnded) resetAmiCallUi(id);
+    })
     .catch((err) => {
       logDebug('hangupAmiCall: FAILED: ' + err.message);
+      // "call not found" = the server no longer knows this call at all, so
+      // there is nothing left to hang up: drop the stuck panel instead of
+      // leaving the operator unable to get out of "В разговоре".
+      if (/call not found/i.test(err.message)) {
+        resetAmiCallUi(id);
+        return;
+      }
       showToast('Не удалось завершить звонок: ' + err.message, { error: true });
     });
+}
+
+// Clears the active/incoming call panels for a call the server says is over
+// (same end state as finalizeAmiRecord, without needing its record).
+function resetAmiCallUi(id) {
+  finalizeAmiRecord({ id: amiRt.activeRecordId || id, endedAt: Date.now() });
+  amiRt.activeRecordId = null;
+  amiRt.pendingActionId = null;
+  callConfirmedAt = null;
+  updateCallButtonEnabled();
 }
 
 function sendAmiDtmf(cfg, digit) {
